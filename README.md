@@ -159,13 +159,13 @@ echo -n "YOUR_JQUANTS_API_KEY" | \
   --data-file=-
 
 # Discord webhook for error notifications (required)
-echo -n "https://discord.com/api/webhooks/..." | \
+echo -n "<YOUR_DISCORD_WEBHOOK_URL>" | \
   gcloud secrets versions add discord-webhook-url \
   --project=gcp-jquants-etl-sample \
   --data-file=-
 
 # GitHub token for Dataform Git sync (required)
-echo -n "ghp_..." | \
+echo -n "<YOUR_GITHUB_PERSONAL_ACCESS_TOKEN>" | \
   gcloud secrets versions add dataform-github \
   --project=gcp-jquants-etl-sample \
   --data-file=-

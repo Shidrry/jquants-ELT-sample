@@ -11,8 +11,14 @@ BQ_TABLE      = "master"
 
 # Date フィールドを STRING → DATE にキャストする。
 # その他フィールドは API 仕様通り STRING のため SAFE_CAST で型を保証する。
+# パーティションは logical_date ベースで管理する。
+# J-Quants API は休日指定時に翌営業日のデータを返すため Date != logical_date になる場合があり、
+# BQ パーティションデコレーター($YYYYMMDD)と Date が不一致になると
+# "Some rows belong to different partitions" エラーになるため、
+# パーティションキーには logical_date を使用する。
 TRANSFORM_SQL = """
 SELECT
+  DATE('{LOGICAL_DATE}') AS logical_date,
   SAFE.PARSE_DATE('%Y-%m-%d', SAFE_CAST(Date     AS STRING)) AS Date,
   SAFE_CAST(Code     AS STRING) AS Code,
   SAFE_CAST(CoName   AS STRING) AS CoName,
@@ -36,10 +42,11 @@ def main() -> None:
     project_id = get_project_id()
     logical_date, _ = get_logical_date()
 
-    gcs_uri  = f"gs://{BUCKET_FN(project_id, env_name)}/{GCS_OBJECT.format(date=logical_date.isoformat())}"
-    bq_dest  = f"{project_id}.{DATASET_FN(env_name)}.{BQ_TABLE}${logical_date.strftime('%Y%m%d')}"
+    gcs_uri       = f"gs://{BUCKET_FN(project_id, env_name)}/{GCS_OBJECT.format(date=logical_date.isoformat())}"
+    bq_dest       = f"{project_id}.{DATASET_FN(env_name)}.{BQ_TABLE}${logical_date.strftime('%Y%m%d')}"
+    transform_sql = TRANSFORM_SQL.replace("{LOGICAL_DATE}", logical_date.isoformat())
 
-    load_gcs_parquet_to_bq(project_id, env_name, gcs_uri, bq_dest, PIPELINE_NAME, logical_date, TRANSFORM_SQL, partition_field="Date")
+    load_gcs_parquet_to_bq(project_id, env_name, gcs_uri, bq_dest, PIPELINE_NAME, logical_date, transform_sql, partition_field="logical_date")
 
 
 if __name__ == "__main__":

@@ -23,7 +23,9 @@ def main() -> None:
     logical_date, logical_date_str = get_logical_date()
     logging.info("Job executed as one at %s", logical_date_str)
 
-    records = fetch_records(project_id, logical_date_str)
+    # API には実行月の1日を渡す（10日実行で月初スナップショットを取得）
+    api_date = logical_date.replace(day=1)
+    records = fetch_records(project_id, api_date.isoformat())
     if not records:
         raise RuntimeError(
             f"No records returned for {logical_date_str}. "

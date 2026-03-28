@@ -101,12 +101,13 @@ with_raw_flags AS (
 ),
 
 -- 銘柄マスタ: logical_date 以前の最新スナップショット（月次取得）
+-- パーティションキーは logical_date（APIレスポンスの Date は休日の場合に翌営業日になるため）
 latest_master AS (
   SELECT Code AS code, CoName AS company_name, S33Nm AS sector_33, MktNm AS market_division
   FROM ${ref("master")}
-  WHERE Date = (
-    SELECT MAX(Date) FROM ${ref("master")}
-    WHERE Date <= CAST('${env.logical_date}' AS DATE)
+  WHERE logical_date = (
+    SELECT MAX(logical_date) FROM ${ref("master")}
+    WHERE logical_date <= CAST('${env.logical_date}' AS DATE)
   )
 ),
 

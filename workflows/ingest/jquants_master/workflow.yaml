@@ -1,6 +1,6 @@
 __metadata__:
   schedule:
-    cron: "0 3 1 * *"
+    cron: "0 3 10 * *"
     time_zone: "Asia/Tokyo"
     argument:
       args: {}

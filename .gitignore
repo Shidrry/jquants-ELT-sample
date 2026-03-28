@@ -30,3 +30,12 @@ Thumbs.db
 # Dataform
 .df-credentials.json
 dataform/.df-credentials.json
+
+# Environment files
+.env
+.env.*
+*.env
+
+# Logs
+*.log
+logs/

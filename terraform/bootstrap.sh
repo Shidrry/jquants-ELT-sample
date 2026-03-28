@@ -42,6 +42,8 @@ else
 fi
 
 # Enable versioning on the state bucket
+# Wait for IAM to propagate after bucket creation
+sleep 10
 gcloud storage buckets update "gs://${BUCKET_NAME}" \
   --versioning \
   --project="${PROJECT_ID}"

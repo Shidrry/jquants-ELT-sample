@@ -1,0 +1,10 @@
+{
+  "warehouse": "bigquery",
+  "defaultDatabase": "",
+  "defaultSchema": "mart_dev",
+  "defaultLocation": "asia-northeast1",
+  "vars": {
+    "env": "dev",
+    "logical_date": "1970-01-01"
+  }
+}

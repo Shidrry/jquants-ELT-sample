@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: env.sourceDataset,
+  name: "master",
+  description: "jquantsから取得した上場銘柄マスタ（raw）。Date・Code をキーに銘柄名・33業種・上場マーケット等を保持する。月次取得（毎月1日）。"
+}

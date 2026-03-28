@@ -1,0 +1,107 @@
+__metadata__:
+  schedule:
+    cron: "00 18 * * *"
+    time_zone: "Asia/Tokyo"
+    argument:
+      args: {}
+  jobs:
+    - id: ingest_to_gcs
+      py: workflows/ingest/jquants_ohlcv/job__ingest_to_gcs.py
+    - id: load_to_bigquery
+      py: workflows/ingest/jquants_ohlcv/job__load_to_bigquery.py
+
+main:
+  params: [args]
+  steps:
+    - init:
+        assign:
+          - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+          - region: REGION_PLACEHOLDER
+          - base_job: ${"projects/" + project_id + "/locations/" + region + "/jobs/ENV_PLACEHOLDER--"}
+          - base_service: ${"projects/" + project_id + "/locations/" + region + "/services/ENV_PLACEHOLDER--"}
+          - logical_date: ${args.logical_date}
+
+    - get_discord_webhook:
+        call: googleapis.secretmanager.v1.projects.secrets.versions.access
+        args:
+          name: ${"projects/" + project_id + "/secrets/discord-webhook-url/versions/latest"}
+        result: discord_secret
+
+    - init_discord_url:
+        assign:
+          - discord_webhook_url: ${text.decode(base64.decode(discord_secret.payload.data))}
+
+    - run_pipeline:
+        try:
+          steps:
+            - get_market_open_service:
+                call: googleapis.run.v2.projects.locations.services.get
+                args:
+                  name: ${base_service + "market-open"}
+                result: market_open_svc
+
+            - check_market_open:
+                call: http.get
+                args:
+                  url: ${market_open_svc.uri + "/market-open?date=" + logical_date}
+                  auth:
+                    type: OIDC
+                    audience: ${market_open_svc.uri}
+                result: market_open_resp
+
+            - branch_on_market_open:
+                switch:
+                  - condition: ${market_open_resp.body.market_open == true}
+                    next: run_job__ingest_to_gcs
+                  - condition: ${true}
+                    next: end
+
+            - run_job__ingest_to_gcs:
+                call: googleapis.run.v2.projects.locations.jobs.run
+                args:
+                  name: ${base_job + "jquants-ohlcv--ingest-to-gcs"}
+                  body:
+                    overrides:
+                      containerOverrides:
+                        - env:
+                            - name: ENV_NAME
+                              value: ENV_PLACEHOLDER
+                            - name: LOGICAL_DATE
+                              value: ${logical_date}
+
+            - run_job__load_to_bigquery:
+                call: googleapis.run.v2.projects.locations.jobs.run
+                args:
+                  name: ${base_job + "jquants-ohlcv--load-to-bigquery"}
+                  body:
+                    overrides:
+                      containerOverrides:
+                        - env:
+                            - name: ENV_NAME
+                              value: ENV_PLACEHOLDER
+                            - name: LOGICAL_DATE
+                              value: ${logical_date}
+        except:
+          as: e
+          steps:
+            - build_discord_msg:
+                assign:
+                  - discord_msg: >-
+                      ${"❌ **jquants_ohlcv 失敗** [ENV_PLACEHOLDER]\n"
+                      + "project: `" + project_id + "`\n"
+                      + "date: `" + logical_date + "`\n"}
+            - notify_discord:
+                call: http.post
+                args:
+                  url: ${discord_webhook_url}
+                  body:
+                    content: >-
+                      ${discord_msg
+                      + "step: `" + json.encode_to_string(default(map.get(e, "steps"), "N/A")) + "`\n"
+                      + "tags: `" + json.encode_to_string(default(map.get(e, "tags"), [])) + "`\n"
+                      + "code: `" + string(default(map.get(e, "code"), "N/A")) + "`\n"
+                      + "message:\n```\n"
+                      + text.substring(default(map.get(e, "message"), json.encode_to_string(e)), 0, 1400)
+                      + "\n```"}
+            - reraise:
+                raise: ${e}

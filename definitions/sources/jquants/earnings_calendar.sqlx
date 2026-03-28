@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: env.sourceDataset,
+  name: "earnings_calendar",
+  description: "jquantsから取得した決算発表予定日データ（raw）。翌営業日の発表予定銘柄を日次蓄積。3月期・9月期決算会社のみ対象。"
+}

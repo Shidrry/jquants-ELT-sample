@@ -1,0 +1,151 @@
+__metadata__:
+  schedule:
+    cron: "20 18 * * *"
+    time_zone: "Asia/Tokyo"
+    argument:
+      args: {}
+
+main:
+  params: [args]
+  steps:
+    - init:
+        assign:
+          - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+          - region: REGION_PLACEHOLDER
+          - base_service: ${"projects/" + project_id + "/locations/" + region + "/services/ENV_PLACEHOLDER--"}
+          - logical_date: ${args.logical_date}
+
+    - get_discord_webhook:
+        call: googleapis.secretmanager.v1.projects.secrets.versions.access
+        args:
+          name: ${"projects/" + project_id + "/secrets/discord-webhook-url/versions/latest"}
+        result: discord_secret
+
+    - init_discord_url:
+        assign:
+          - discord_webhook_url: ${text.decode(base64.decode(discord_secret.payload.data))}
+
+    - run_dataform:
+        try:
+          steps:
+            - get_market_open_service:
+                call: googleapis.run.v2.projects.locations.services.get
+                args:
+                  name: ${base_service + "market-open"}
+                result: market_open_svc
+
+            - check_market_open:
+                call: http.get
+                args:
+                  url: ${market_open_svc.uri + "/market-open?date=" + logical_date}
+                  auth:
+                    type: OIDC
+                    audience: ${market_open_svc.uri}
+                result: market_open_resp
+
+            - branch_on_market_open:
+                switch:
+                  - condition: ${market_open_resp.body.market_open == true}
+                    next: wait_for_data
+                  - condition: ${true}
+                    next: end
+
+            - wait_for_data:
+                call: poll_until_data_loaded
+                args:
+                  project_id: ${project_id}
+                  logical_date: ${logical_date}
+                  max_attempts: 4
+                  wait_seconds: 900
+
+            - compile_dataform:
+                call: http.post
+                args:
+                  url: ${"https://dataform.googleapis.com/v1beta1/projects/" + project_id + "/locations/" + region + "/repositories/DATAFORM_REPO_PLACEHOLDER/compilationResults"}
+                  auth:
+                    type: OAuth2
+                  body:
+                    gitCommitish: "COMMIT_SHA_PLACEHOLDER"
+                    codeCompilationConfig:
+                      defaultDatabase: ${project_id}
+                      vars:
+                        env: "ENV_PLACEHOLDER"
+                        logical_date: ${logical_date}
+                result: compilation_result
+
+            - invoke_dataform:
+                call: http.post
+                args:
+                  url: ${"https://dataform.googleapis.com/v1beta1/projects/" + project_id + "/locations/" + region + "/repositories/DATAFORM_REPO_PLACEHOLDER/workflowInvocations"}
+                  auth:
+                    type: OAuth2
+                  body:
+                    compilationResult: ${compilation_result.body.name}
+                    invocationConfig:
+                      includedTargets:
+                        - database: ${project_id}
+                          schema: "mart_ENV_PLACEHOLDER"
+                          name: "report_stock_dashboard"
+                      transitiveDependenciesIncluded: true
+        except:
+          as: e
+          steps:
+            - build_discord_msg:
+                assign:
+                  - discord_msg: >-
+                      ${"❌ **dataform 失敗** [ENV_PLACEHOLDER]\n"
+                      + "project: `" + project_id + "`\n"
+                      + "date: `" + logical_date + "`\n"}
+            - notify_discord:
+                call: http.post
+                args:
+                  url: ${discord_webhook_url}
+                  body:
+                    content: >-
+                      ${discord_msg
+                      + "step: `" + json.encode_to_string(default(map.get(e, "steps"), "N/A")) + "`\n"
+                      + "tags: `" + json.encode_to_string(default(map.get(e, "tags"), [])) + "`\n"
+                      + "code: `" + string(default(map.get(e, "code"), "N/A")) + "`\n"
+                      + "message:\n```\n"
+                      + text.substring(default(map.get(e, "message"), json.encode_to_string(e)), 0, 1400)
+                      + "\n```"}
+            - reraise:
+                raise: ${e}
+
+
+poll_until_data_loaded:
+  params: [project_id, logical_date, max_attempts, wait_seconds]
+  steps:
+    - init_attempt:
+        assign:
+          - attempt: 0
+
+    - do_query:
+        call: http.post
+        args:
+          url: ${"https://bigquery.googleapis.com/bigquery/v2/projects/" + project_id + "/queries"}
+          auth:
+            type: OAuth2
+          body:
+            query: ${"SELECT COUNT(*) AS cnt FROM `" + project_id + ".pipeline_metadata_prod.data_loads` WHERE pipeline_name = 'jquants_ohlcv' AND logical_date = '" + logical_date + "'"}
+            useLegacySql: false
+            timeoutMs: 10000
+        result: query_result
+
+    - check_loaded:
+        switch:
+          - condition: ${int(query_result.body.rows[0].f[0].v) > 0}
+            return: true
+          - condition: ${attempt >= max_attempts - 1}
+            raise: '${"Timeout: jquants_ohlcv data not loaded for " + logical_date}'
+
+    - increment:
+        assign:
+          - attempt: ${attempt + 1}
+
+    - sleep:
+        call: sys.sleep
+        args:
+          seconds: ${wait_seconds}
+        next: do_query
+

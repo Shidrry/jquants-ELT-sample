@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: env.sourceDataset,
+  name: "fins_summary",
+  description: "jquantsから取得した財務情報サマリー（raw）。DiscDate・Code をキーに決算開示情報を保持する。日次取得・日付パーティション。"
+}

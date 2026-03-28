@@ -1,0 +1,136 @@
+main:
+  params: [args]
+  steps:
+    - init:
+        assign:
+          - dispatcher_url: "DISPATCHER_URL_PLACEHOLDER"
+          - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+          - region: "REGION_PLACEHOLDER"
+          - workflow_name: ${default(map.get(args, "workflow_name"), "")}
+          - start: ${default(map.get(args, "start"), "")}
+          - end: ${default(map.get(args, "end"), "")}
+
+    - get_discord_webhook:
+        call: googleapis.secretmanager.v1.projects.secrets.versions.access
+        args:
+          name: ${"projects/" + project_id + "/secrets/discord-webhook-url/versions/latest"}
+        result: discord_secret
+
+    - init_discord_url:
+        assign:
+          - discord_webhook_url: ${text.decode(base64.decode(discord_secret.payload.data))}
+
+    - run_with_notification:
+        try:
+          steps:
+            - validate:
+                switch:
+                  - condition: ${workflow_name == ""}
+                    raise: {"message": "Missing args.workflow_name", "tags": ["ValidationError"], "code": 400}
+                  - condition: ${start == ""}
+                    raise: {"message": "Missing args.start", "tags": ["ValidationError"], "code": 400}
+                  - condition: ${end == ""}
+                    raise: {"message": "Missing args.end", "tags": ["ValidationError"], "code": 400}
+
+            - get_dates:
+                call: http.get
+                args:
+                  url: ${dispatcher_url + "/dates?start=" + start + "&end=" + end}
+                  auth:
+                    type: OIDC
+                    audience: ${dispatcher_url}
+                result: dates_resp
+
+            - sequential_loop:
+                for:
+                  value: logical_date
+                  in: ${dates_resp.body.dates}
+                  steps:
+                    - build_argument:
+                        assign:
+                          - exec_arg:
+                              logical_date: ${logical_date}
+
+                    - start_execution:
+                        call: googleapis.workflowexecutions.v1.projects.locations.workflows.executions.create
+                        args:
+                          parent: ${"projects/" + project_id + "/locations/" + region + "/workflows/" + workflow_name}
+                          body:
+                            argument: ${json.encode_to_string(exec_arg)}
+                        result: execution
+
+                    - wait_for_completion:
+                        call: poll_until_terminal
+                        args:
+                          execution_name: ${execution.name}
+                        result: final_state
+
+                    - log_result:
+                        call: sys.log
+                        args:
+                          text: ${"[backfill] date=" + logical_date + " state=" + final_state}
+                          severity: INFO
+
+                    - notify_if_failed:
+                        switch:
+                          - condition: ${final_state != "SUCCEEDED"}
+                            steps:
+                              - post_discord:
+                                  call: http.post
+                                  args:
+                                    url: ${discord_webhook_url}
+                                    body:
+                                      content: '${"⚠️ **backfill 失敗** [" + workflow_name + "]\ndate: `" + logical_date + "` → " + final_state}'
+        except:
+          as: e
+          steps:
+            - build_discord_msg:
+                assign:
+                  - discord_msg: >-
+                      ${"❌ **backfill エラー** [" + workflow_name + "]\n"
+                      + "project: `" + project_id + "`\n"}
+            - notify_discord_on_error:
+                call: http.post
+                args:
+                  url: ${discord_webhook_url}
+                  body:
+                    content: >-
+                      ${discord_msg
+                      + "step: `" + json.encode_to_string(default(map.get(e, "steps"), "N/A")) + "`\n"
+                      + "tags: `" + json.encode_to_string(default(map.get(e, "tags"), [])) + "`\n"
+                      + "code: `" + string(default(map.get(e, "code"), "N/A")) + "`\n"
+                      + "message:\n```\n"
+                      + text.substring(default(map.get(e, "message"), json.encode_to_string(e)), 0, 1400)
+                      + "\n```"}
+            - reraise:
+                raise: ${e}
+
+    - done:
+        return: "completed"
+
+
+poll_until_terminal:
+  params: [execution_name]
+  steps:
+    - get_execution:
+        call: googleapis.workflowexecutions.v1.projects.locations.workflows.executions.get
+        args:
+          name: ${execution_name}
+        result: exec_info
+
+    - check_state:
+        switch:
+          - condition: ${exec_info.state == "SUCCEEDED"}
+            return: ${exec_info.state}
+          - condition: ${exec_info.state == "FAILED"}
+            return: ${exec_info.state}
+          - condition: ${exec_info.state == "CANCELLED"}
+            return: ${exec_info.state}
+          - condition: ${exec_info.state == "UNAVAILABLE"}
+            return: ${exec_info.state}
+
+    - sleep:
+        call: sys.sleep
+        args:
+          seconds: 15
+        next: get_execution

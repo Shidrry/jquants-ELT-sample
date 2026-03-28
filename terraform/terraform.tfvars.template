@@ -1,0 +1,3 @@
+project_id      = "gcp-jquants-etl-sample"
+region          = "asia-northeast1"
+github_repo_url = "https://github.com/<YOUR_GITHUB_OWNER>/jquants-ETL-sample.git"

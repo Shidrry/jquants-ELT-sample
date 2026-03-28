@@ -1,0 +1,23 @@
+config {
+  type: "table",
+  schema: env.martDataset,
+  description: "株価監視ダッシュボード用テーブル。直近5営業日分のデータを1テーブルに格納。report_no は集計時点の最新 trade_date = 1、1営業日前 = 2 ... 4営業日前 = 5。Boolean カラムは Looker Studio 互換のため INT64（0/1）に変換。Looker から参照する想定。"
+}
+
+-- 直近5営業日分のデータを1テーブルに統合
+-- report_no: 最新 trade_date = 1, 1営業日前 = 2, ..., 4営業日前 = 5
+-- Boolean → INT64 変換: Looker Studio が BOOL を COUNTIF 集計するため 0/1 数値に置き換え
+SELECT
+  DENSE_RANK() OVER (ORDER BY trade_date DESC) AS report_no,
+  * EXCEPT (is_bullish, had_stop_high_5d, had_stop_low_5d),
+  IF(is_bullish,       1, 0) AS is_bullish,
+  IF(had_stop_high_5d, 1, 0) AS had_stop_high_5d,
+  IF(had_stop_low_5d,  1, 0) AS had_stop_low_5d
+FROM ${ref("int_daily_stock_metrics")}
+WHERE trade_date IN (
+  SELECT trade_date FROM (
+    SELECT DISTINCT trade_date,
+           DENSE_RANK() OVER (ORDER BY trade_date DESC) AS rn
+    FROM ${ref("int_daily_stock_metrics")}
+  ) WHERE rn <= 5
+)

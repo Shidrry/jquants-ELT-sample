@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  schema: env.sourceDataset,
+  name: "daily_quotes",
+  description: "jquantsから取得した日次株価データ（raw）"
+}

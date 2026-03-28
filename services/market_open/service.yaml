@@ -1,0 +1,34 @@
+# Cloud Run Service Configuration
+# This file defines deployment parameters for this service
+
+name: market_open
+description: Market status check service
+
+deployment:
+  # Container port the service listens on
+  port: 8080
+  
+  # Memory allocation (default: 256Mi)
+  memory: 256Mi
+  
+  # CPU cores (default: 0.083)
+  cpu: "0.083"
+  
+  # Request timeout in seconds (default: 300)
+  timeout: 60
+  
+  # Max concurrent requests per container (default: 80)
+  max-instances: 10
+  
+  # Allow unauthenticated requests
+  allow-unauthenticated: false
+
+# How to start the web server inside the container
+startup:
+  command: uvicorn
+  args:
+    - services.market_open.app:app
+    - --host
+    - 0.0.0.0
+    - --port
+    - 8080

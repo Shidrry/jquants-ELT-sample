@@ -1,0 +1,642 @@
+substitutions:
+  _ENV: dev
+  _REGION: asia-northeast1
+  _AR_REPO: data-pipeline
+
+  # Scheduler → dispatcher の OIDC に使う SA（Cloud Build トリガーで設定すること）
+  _SCHEDULER_SA_EMAIL: ""
+
+  # Workflows 実行 SA（Cloud Build トリガーで設定すること）
+  _WORKFLOW_EXEC_SA_EMAIL: ""
+
+  # ダイアグラム生成を有効にするフラグ（"true" のときのみ生成・アップロード）
+  # dev はトリガーでfalseに指定
+  _GENERATE_DIAGRAM: "true"
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  substitutionOption: ALLOW_LOOSE
+
+steps:
+  # 0) ツール
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    id: setup
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        apt-get update -y >/dev/null
+        apt-get install -y jq python3 python3-venv python3-pip >/dev/null
+
+        # venv 作成（PEP668回避）
+        python3 -m venv /workspace/.venv
+        /workspace/.venv/bin/pip -q install --upgrade pip
+        /workspace/.venv/bin/pip -q install pyyaml
+
+        echo "ENV=${_ENV}"
+        echo "REGION=${_REGION}"
+        echo "PROJECT_ID=${PROJECT_ID}"
+
+  # 1) Desired state を repo から生成（services / workflows / jobs / schedules）
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    id: plan
+    entrypoint: bash
+    env:
+      - _ENV=${_ENV}
+      - _REGION=${_REGION}
+    args:
+      - -ceu
+      - |
+        /workspace/.venv/bin/python - <<'PY'
+        import os, glob, json, re, pathlib, yaml
+
+        ENV = os.environ.get("_ENV","dev")
+
+        def hyphenize(s: str) -> str:
+          s = s.strip().lower()
+          s = s.replace("_","-")
+          s = re.sub(r"[^a-z0-9-]+", "-", s)
+          s = re.sub(r"-+", "-", s).strip("-")
+          return s
+
+        # services
+        services = []
+        for p in sorted(glob.glob("services/*/service.yaml")):
+          cfg = yaml.safe_load(pathlib.Path(p).read_text(encoding="utf-8"))
+          name_raw = cfg["name"]  # e.g. market_open
+          svc_name = f"{ENV}--{hyphenize(name_raw)}"  # dev--market-open
+          services.append({
+            "name_raw": name_raw,
+            "name": svc_name,
+            "path": p,
+            "dir": os.path.basename(os.path.dirname(p)),
+          })
+
+        # workflows (+ jobs + schedule)
+        workflows = []
+        for p in sorted(glob.glob("workflows/*/*/workflow.yaml")):
+          wf_dir = os.path.basename(os.path.dirname(p))  # e.g. jquants_ohlcv
+          wf_name = f"{ENV}--{wf_dir}"  # keep underscore to match trigger path naming you want
+          doc = yaml.safe_load(pathlib.Path(p).read_text(encoding="utf-8"))
+
+          meta = doc.get("__metadata__", {}) or {}
+          schedule = (meta.get("schedule") or {}) if isinstance(meta, dict) else {}
+          jobs = meta.get("jobs", []) if isinstance(meta, dict) else []
+
+          # jobs normalize
+          job_defs = []
+          for j in jobs or []:
+            jid = j["id"]              # ingest_daily_quotes
+            py_path = j["py"]          # workflows/jquants_ohlcv/job__ingest_daily_quotes.py
+            job_name = f"{ENV}--{hyphenize(wf_dir)}--{hyphenize(jid)}"
+            job_defs.append({
+              "id": jid,
+              "py": py_path,
+              "name": job_name,
+            })
+
+          workflows.append({
+            "dir": wf_dir,
+            "name": wf_name,
+            "workflow_yaml": p,
+            "schedule": schedule,
+            "jobs": job_defs,
+          })
+
+        desired = {"env": ENV, "services": services, "workflows": workflows}
+        os.makedirs("/workspace/_state", exist_ok=True)
+        pathlib.Path("/workspace/_state/desired.json").write_text(json.dumps(desired, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        # dispatcher allowlist: workflow 名（dev--jquants_ohlcv の形式）
+        allowlist = ",".join([w["name"] for w in workflows])
+        pathlib.Path("/workspace/_state/wf_allowlist.txt").write_text(allowlist, encoding="utf-8")
+
+        print(json.dumps(desired, indent=2, ensure_ascii=False))
+        print("WF_ALLOWLIST:", allowlist)
+        PY
+
+  # 2) コンテナ build/push（共通：services / jobs / dispatcher で使い回す想定）
+  #    既存のあなたの運用（ルート Dockerfile で全コードを含める）を踏襲
+  - name: gcr.io/cloud-builders/docker
+    id: build-image
+    waitFor: ['setup']  # plan と並列実行
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        docker pull ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/data-pipeline:latest || true
+        docker build \
+          --cache-from ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/data-pipeline:latest \
+          -t ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/data-pipeline:${SHORT_SHA} \
+          -t ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/data-pipeline:latest \
+          .
+  - name: gcr.io/cloud-builders/docker
+    id: push-image
+    waitFor: ['build-image']
+    args:
+      - push
+      - --all-tags
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/data-pipeline
+
+  # 3) Cloud Run Services を deploy（service.yaml を参照して設定）
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    id: deploy-services
+    waitFor: ['push-image', 'plan']
+    entrypoint: bash
+    env:
+      - IMAGE=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/data-pipeline:${SHORT_SHA}
+      - _REGION=${_REGION}
+      - _ENV=${_ENV}
+      - PROJECT_ID=${PROJECT_ID}
+      - WORKFLOW_EXEC_SA_EMAIL=${_WORKFLOW_EXEC_SA_EMAIL}
+    args:
+      - -ceu
+      - |
+        WF_ALLOWLIST="$(cat /workspace/_state/wf_allowlist.txt)"
+
+        /workspace/.venv/bin/python - <<'PY'
+        import json, os, subprocess, pathlib, yaml
+
+        desired = json.load(open("/workspace/_state/desired.json", "r", encoding="utf-8"))
+        env = desired["env"]
+        region = os.environ["_REGION"]
+        project = os.environ["PROJECT_ID"]
+        workflow_exec_sa_email = os.environ.get("WORKFLOW_EXEC_SA_EMAIL", "")
+
+        # bash から渡す
+        image = os.environ.get("IMAGE", "")
+
+        allowlist = pathlib.Path("/workspace/_state/wf_allowlist.txt").read_text(encoding="utf-8").strip()
+        def sh(cmd):
+          print("+", " ".join(cmd))
+          subprocess.check_call(cmd)
+
+        for s in desired["services"]:
+          cfg = yaml.safe_load(pathlib.Path(s["path"]).read_text(encoding="utf-8"))
+          deploy = cfg.get("deployment", {}) or {}
+          startup = cfg.get("startup", {}) or {}
+
+          name = s["name"]
+
+          port = str(deploy.get("port", 8080))
+          memory = str(deploy.get("memory", "256Mi"))
+          cpu = str(deploy.get("cpu", "0.083"))
+          timeout = str(deploy.get("timeout", 300))
+          max_instances = str(deploy.get("max-instances", 10))
+          allow_unauth = bool(deploy.get("allow-unauthenticated", False))
+
+          cmd = [
+            "gcloud","run","deploy", name,
+            "--project", project,
+            "--region", region,
+            "--platform", "managed",
+            "--image", image,
+            "--service-account", workflow_exec_sa_email,
+            "--port", port,
+            "--memory", memory,
+            "--cpu", cpu,
+            "--timeout", timeout,
+            "--max-instances", max_instances,
+            "--labels", f"managed_by=cloudbuild,env={env}",
+            "--quiet",
+          ]
+
+          # startup command/args がある場合は run コンテナの command/args に反映
+          if startup.get("command"):
+            cmd += ["--command", str(startup["command"])]
+          if startup.get("args"):
+              # gcloud run deploy は --args を 1 回だけ、カンマ区切りで渡す必要がある
+              joined = ",".join(str(a) for a in startup["args"])
+              cmd += ["--args", joined]
+
+          # env vars（dispatcher 用）
+          # workflow_dispatcher は name_raw/dir で識別するのではなく、FastAPI title などに依存したくないので “dir名” で判定
+          # services/workflow_dispatcher/service.yaml がある想定。無い場合でも “workflow_dispatcher” ディレクトリなら注入。
+          if s.get("dir") == "workflow_dispatcher":
+            env_file = "/workspace/_state/workflow_dispatcher_env.yaml"
+            pathlib.Path(env_file).write_text(
+              "PROJECT_ID: {project}\n"
+              "REGION: {region}\n"
+              'WF_ALLOWLIST: "{allowlist}"\n'.format(
+                project=project,
+                region=region,
+                allowlist=allowlist.replace('"', '\\"'),
+              ),
+              encoding="utf-8",
+            )
+            cmd += ["--env-vars-file", env_file]
+
+          if allow_unauth:
+            cmd += ["--allow-unauthenticated"]
+          else:
+            cmd += ["--no-allow-unauthenticated"]
+
+          sh(cmd)
+        PY
+
+
+  # 4) Cloud Run Jobs を deploy（workflow.yaml の __metadata__.jobs を正として生成）
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    id: deploy-jobs
+    waitFor: ['push-image', 'plan']  # deploy-services と並列実行
+    entrypoint: bash
+    env:
+      - IMAGE=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/data-pipeline:${SHORT_SHA}
+      - _REGION=${_REGION}
+      - PROJECT_ID=${PROJECT_ID}
+      - WORKFLOW_EXEC_SA_EMAIL=${_WORKFLOW_EXEC_SA_EMAIL}
+    args:
+      - -ceu
+      - |
+        /workspace/.venv/bin/python - <<'PY'
+        import json, os, subprocess
+
+        desired = json.load(open("/workspace/_state/desired.json","r",encoding="utf-8"))
+        env = desired["env"]
+        region = os.environ["_REGION"]
+        project = os.environ["PROJECT_ID"]
+        image = os.environ["IMAGE"]
+        worker_sa = os.environ["WORKFLOW_EXEC_SA_EMAIL"]
+
+        def sh(cmd):
+          print("+", " ".join(cmd))
+          subprocess.check_call(cmd)
+
+        for w in desired["workflows"]:
+          for j in w["jobs"]:
+            job_name = j["name"]        # dev--jquants-ohlcv--ingest-daily-quotes
+            py_path = j["py"]           # workflows/jquants_ohlcv/job__ingest_daily_quotes.py
+
+            # ここが肝：
+            # “全コード入り共通 image” を前提に、python でファイル実行する Job として deploy
+            # workflow 側から ENV_NAME / LOGICAL_DATE が container env で来る想定を維持
+            sh([
+              "gcloud","run","jobs","deploy", job_name,
+              "--project", project,
+              "--region", region,
+              "--image", image,
+              "--labels", f"managed_by=cloudbuild,env={env}",
+              "--service-account", worker_sa,
+              "--command", "python",
+              "--args", py_path,
+              "--set-env-vars", f"ENV_NAME={env}",
+              "--max-retries", "0",
+              "--task-timeout", "3600",
+              "--quiet",
+            ])
+        PY
+
+  # 5) Workflows を deploy（workflow.yaml を “レンダリング” して deploy）
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    id: deploy-workflows
+    waitFor: ['deploy-services']  # dispatcher URL を取得するため services の完了を待つ
+    entrypoint: bash
+    env:
+      - _REGION=${_REGION}
+      - PROJECT_ID=${PROJECT_ID}
+      - WORKFLOW_EXEC_SA_EMAIL=${_WORKFLOW_EXEC_SA_EMAIL}
+      - COMMIT_SHA=${COMMIT_SHA}
+    args:
+      - -ceu
+      - |
+        /workspace/.venv/bin/python - <<'PY'
+        import json, os, pathlib, re, subprocess, yaml
+
+        desired = json.load(open("/workspace/_state/desired.json","r",encoding="utf-8"))
+        env = desired["env"]
+        region = os.environ["_REGION"]
+        project = os.environ["PROJECT_ID"]
+        exec_sa = os.environ.get("WORKFLOW_EXEC_SA_EMAIL","")
+        commit_sha = os.environ.get("COMMIT_SHA", "")
+
+        # dispatcher service 名を desired から取得
+        disp = [s for s in desired["services"] if s["dir"] == "workflow_dispatcher"]
+        if not disp:
+            raise RuntimeError("services/workflow_dispatcher/service.yaml が見つかりません")
+
+        dispatcher_svc_name = disp[0]["name"]
+
+        # Cloud Run から実URLを取得
+        dispatcher_url = subprocess.check_output([
+            "gcloud","run","services","describe", dispatcher_svc_name,
+            "--project", project,
+            "--region", region,
+            "--format=value(status.url)"
+        ]).decode().strip()
+
+        if not dispatcher_url:
+            raise RuntimeError("Failed to resolve dispatcher URL.")
+
+        print("Resolved dispatcher URL:", dispatcher_url)
+
+        out_dir = pathlib.Path("/workspace/_state/rendered")
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        def sh(cmd):
+            print("+", " ".join(cmd))
+            subprocess.check_call(cmd)
+
+        for w in desired["workflows"]:
+            raw = pathlib.Path(w["workflow_yaml"]).read_text(encoding="utf-8")
+
+            # 1) ENV_PLACEHOLDER 置換
+            branch = "main" if env == "prod" else "develop"
+            dataform_repo = "stock-analytics-" + env
+            rendered = (raw
+              .replace("ENV_PLACEHOLDER", env)
+              .replace("BRANCH_PLACEHOLDER", branch)
+              .replace("COMMIT_SHA_PLACEHOLDER", commit_sha)
+              .replace("DATAFORM_REPO_PLACEHOLDER", dataform_repo)
+              .replace("DISPATCHER_URL_PLACEHOLDER", dispatcher_url)
+              .replace("REGION_PLACEHOLDER", region)
+            )
+
+            # 2) __metadata__ ブロックをテキストで除去する
+            # yaml.dump() を経由すると Cloud Workflows 式内の " や \n がエスケープされて壊れるため、
+            # 正規表現で __metadata__: 行から始まるインデントブロックをそのまま削除する
+            rendered_clean = re.sub(
+                r'^__metadata__:[^\n]*\n(?:[ \t][^\n]*\n|\n)*',
+                '',
+                rendered,
+                flags=re.MULTILINE,
+            )
+
+            # 3) deploy 用 YAML として書き出し（テキストをそのまま出力）
+            tmp = out_dir / f"{w['dir']}.workflow.rendered.yaml"
+            tmp.write_text(rendered_clean, encoding="utf-8")
+
+            cmd = [
+                "gcloud","workflows","deploy", w["name"],
+                "--project", project,
+                "--location", region,
+                "--source", str(tmp),
+                "--labels", f"managed_by=cloudbuild,env={env}",
+                "--quiet",
+            ]
+            if exec_sa:
+                cmd += ["--service-account", exec_sa]
+
+            sh(cmd)
+        PY
+
+  # 6) Scheduler を deploy（workflow.yaml の __metadata__.schedule を正として作成）
+  #    dispatcher: /trigger/{workflow_name} を叩く
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    id: deploy-schedulers
+    waitFor: ['deploy-services']  # deploy-workflows と並列実行
+    entrypoint: bash
+    env:
+      - _REGION=${_REGION}
+      - PROJECT_ID=${PROJECT_ID}
+      - SCHEDULER_SA_EMAIL=${_SCHEDULER_SA_EMAIL}
+    args:
+      - -ceu
+      - |
+        /workspace/.venv/bin/python - <<'PY'
+        import json, os, subprocess
+
+        desired = json.load(open("/workspace/_state/desired.json","r",encoding="utf-8"))
+        env = desired["env"]
+        region = os.environ["_REGION"]
+        project = os.environ["PROJECT_ID"]
+        scheduler_sa = os.environ["SCHEDULER_SA_EMAIL"]
+
+        # dispatcher service name: env--workflow-dispatcher ではなく、
+        # services/workflow_dispatcher/service.yaml の name に依存する。
+        disp = [s for s in desired["services"] if s["dir"] == "workflow_dispatcher"]
+        if not disp:
+          raise RuntimeError("services/workflow_dispatcher/service.yaml が見つかりません（dispatcher URL を解決できません）")
+        dispatcher_svc_name = disp[0]["name"]
+
+        def sh(cmd):
+          print("+", " ".join(cmd))
+          subprocess.check_call(cmd)
+
+        def exists_scheduler(job_name: str) -> bool:
+          try:
+            subprocess.check_call(
+              ["gcloud","scheduler","jobs","describe", job_name,
+               "--project", project, "--location", region],
+              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            return True
+          except subprocess.CalledProcessError:
+            return False
+
+        url = subprocess.check_output([
+          "gcloud","run","services","describe", dispatcher_svc_name,
+          "--project", project,
+          "--region", region,
+          "--format=value(status.url)"
+        ]).decode().strip()
+        if not url:
+          raise RuntimeError("Failed to get dispatcher URL.")
+
+        for w in desired["workflows"]:
+          sched = w.get("schedule") or {}
+          cron = sched.get("cron")
+          tz = sched.get("time_zone","Asia/Tokyo")
+
+          if not cron:
+            continue
+
+          job_name = f"{env}--sched--{w['dir']}"
+          target = f"{url}/trigger/{w['name']}"
+
+          common = [
+            "--project", project,
+            "--location", region,
+            "--schedule", cron,
+            "--time-zone", tz,
+            "--http-method", "GET",
+            "--uri", target,
+            "--oidc-service-account-email", scheduler_sa,
+            "--oidc-token-audience", url,
+            "--description", f"[managed_by=cloudbuild env={env}]",
+            "--quiet",
+          ]
+
+          if exists_scheduler(job_name):
+            # update は --headers ではなく --update-headers
+            sh(["gcloud","scheduler","jobs","update","http", job_name]
+               + common
+               + ["--update-headers", "Content-Type=application/json"])
+          else:
+            sh(["gcloud","scheduler","jobs","create","http", job_name]
+               + common
+               + ["--headers", "Content-Type=application/json"])
+
+          if env == "dev":
+            # dev 環境は常に scheduler を有効化
+            sh(["gcloud","scheduler","jobs","resume", job_name,
+                "--project", project, "--location", region, "--quiet"])
+        PY
+
+
+  # 6.5) prod リリース時に dev の Scheduler だけ停止（pause）
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    id: pause-dev-schedulers-on-prod
+    waitFor: ['deploy-schedulers']
+    entrypoint: bash
+    env:
+      - _REGION=${_REGION}
+      - PROJECT_ID=${PROJECT_ID}
+    args:
+      - -ceu
+      - |
+        if [ "${_ENV}" != "prod" ]; then
+          echo "ENV=${_ENV} なので dev scheduler pause はスキップ"
+          exit 0
+        fi
+
+        /workspace/.venv/bin/python - <<'PY'
+        import json, os, subprocess
+
+        desired = json.load(open("/workspace/_state/desired.json","r",encoding="utf-8"))
+        region = os.environ["_REGION"]
+        project = os.environ["PROJECT_ID"]
+
+        def sh(cmd):
+          print("+", " ".join(cmd))
+          subprocess.check_call(cmd)
+
+        # prod の desired.json から workflow_dir を使って dev の scheduler 名を組み立てる
+        for w in desired["workflows"]:
+          dev_job_name = f"dev--sched--{w['dir']}"
+          # 無ければ無視、あれば pause
+          try:
+            sh(["gcloud","scheduler","jobs","pause", dev_job_name,
+                "--project", project, "--location", region, "--quiet"])
+          except subprocess.CalledProcessError:
+            print(f"skip: {dev_job_name} (not found or already paused)")
+        PY
+
+
+  # 7) Cleanup（GitHub に無い “managed_by=cloudbuild, env=_ENV” の service/job/workflow/scheduler を削除）
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    id: cleanup
+    waitFor: ['deploy-services', 'deploy-jobs', 'deploy-workflows', 'deploy-schedulers', 'pause-dev-schedulers-on-prod']
+    entrypoint: bash
+    env:
+      - _REGION=${_REGION}
+      - PROJECT_ID=${PROJECT_ID}
+    args:
+      - -ceu
+      - |
+        /workspace/.venv/bin/python - <<'PY'
+        import json, os, subprocess
+
+        desired = json.load(open("/workspace/_state/desired.json","r",encoding="utf-8"))
+        env = desired["env"]
+        region = os.environ["_REGION"]
+        project = os.environ["PROJECT_ID"]
+
+        desired_services = set([s["name"] for s in desired["services"]])
+        desired_workflows = set([w["name"] for w in desired["workflows"]])
+        desired_jobs = set([j["name"] for w in desired["workflows"] for j in w["jobs"]])
+
+        desired_schedulers = set()
+        for w in desired["workflows"]:
+          if (w.get("schedule") or {}).get("cron"):
+            desired_schedulers.add(f"{env}--sched--{w['dir']}")
+
+        def out(cmd):
+          return subprocess.check_output(cmd).decode().splitlines()
+
+        def sh(cmd):
+          print("+", " ".join(cmd))
+          subprocess.check_call(cmd)
+
+        # Workflows
+        existing_wf_full = out([
+          "gcloud","workflows","list",
+          "--project", project,
+          "--location", region,
+          "--filter", f"labels.managed_by=cloudbuild AND labels.env={env}",
+          "--format", "value(name)"
+        ])
+        existing_wf = set([x.split("/")[-1] for x in existing_wf_full if x.strip()])
+        for n in sorted(existing_wf - desired_workflows):
+          sh(["gcloud","workflows","delete", n, "--project", project, "--location", region, "--quiet"])
+
+        # Cloud Run Jobs
+        existing_jobs = set([x.strip() for x in out([
+          "gcloud","run","jobs","list",
+          "--project", project,
+          "--region", region,
+          "--filter", f"metadata.labels.managed_by=cloudbuild AND metadata.labels.env={env}",
+          "--format", "value(metadata.name)"
+        ]) if x.strip()])
+        for n in sorted(existing_jobs - desired_jobs):
+          sh(["gcloud","run","jobs","delete", n, "--project", project, "--region", region, "--quiet"])
+
+        # Cloud Run Services
+        existing_svcs = set([x.strip() for x in out([
+          "gcloud","run","services","list",
+          "--project", project,
+          "--region", region,
+          "--filter", f"metadata.labels.managed_by=cloudbuild AND metadata.labels.env={env}",
+          "--format", "value(metadata.name)"
+        ]) if x.strip()])
+        for n in sorted(existing_svcs - desired_services):
+          sh(["gcloud","run","services","delete", n, "--project", project, "--region", region, "--quiet"])
+
+        # Scheduler（description に managed_by/env を入れている前提）
+        existing_sched_full = out([
+          "gcloud","scheduler","jobs","list",
+          "--project", project,
+          "--location", region,
+          "--filter", f'description~"managed_by=cloudbuild" AND description~"env={env}"',
+          "--format", "value(name)"
+        ])
+        existing_sched = set([x.split("/")[-1] for x in existing_sched_full if x.strip()])
+        for n in sorted(existing_sched - desired_schedulers):
+          sh(["gcloud","scheduler","jobs","delete", n, "--project", project, "--location", region, "--quiet"])
+
+        print("Cleanup done.")
+        PY
+
+  # 8) ダイアグラム生成（diagrams/generate_architecture.py を手動管理・デプロイ時にレンダリング）
+  #    _GENERATE_DIAGRAM=true のときのみ実行。prod トリガーで設定し、dev は任意で渡す。
+  - name: python:3.11-slim
+    id: generate-architecture-diagram
+    waitFor: ['plan']
+    entrypoint: bash
+    env:
+      - _ENV=${_ENV}
+    args:
+      - -ceu
+      - |
+        if [ "${_GENERATE_DIAGRAM}" != "true" ]; then
+          echo "ダイアグラム生成をスキップ (_GENERATE_DIAGRAM=${_GENERATE_DIAGRAM})"
+          mkdir -p docs
+          touch docs/architecture_${_ENV}.png
+          exit 0
+        fi
+
+        apt-get update -y >/dev/null
+        apt-get install -y graphviz >/dev/null
+        pip install --no-cache-dir -q -r diagrams/requirements.txt
+        mkdir -p docs
+        python diagrams/generate_architecture.py
+        ls -la docs
+
+
+  # 9) diagram を "latest" にアップロード（固定URL用）
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    id: upload-architecture-diagram-latest
+    waitFor: ['generate-architecture-diagram']
+    entrypoint: bash
+    env:
+      - _ENV=${_ENV}
+    args:
+      - -ceu
+      - |
+        if [ "${_GENERATE_DIAGRAM}" != "true" ]; then
+          echo "ダイアグラムアップロードをスキップ (_GENERATE_DIAGRAM=${_GENERATE_DIAGRAM})"
+          exit 0
+        fi
+        gsutil -m cp docs/architecture_${_ENV}.png \
+          gs://${PROJECT_ID}-build-artifacts/diagrams/${_ENV}/latest/architecture.png
+        gsutil setmeta -h "Cache-Control:no-cache, max-age=0" \
+          gs://${PROJECT_ID}-build-artifacts/diagrams/${_ENV}/latest/architecture.png

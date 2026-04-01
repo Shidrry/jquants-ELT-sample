@@ -26,7 +26,7 @@ Cloud Scheduler (OIDC)
 | `jquants_fins_summary` | Financial summary | 19:30 weekdays | `staging_jquants.fins_summary` |
 | `jquants_fins_summary_confirmed` | Confirmed financials | 01:30 weekdays | `staging_jquants.fins_summary` |
 | `jquants_earnings_calendar` | Earnings calendar | 19:30 weekdays | `staging_jquants.earnings_calendar` |
-| `jquants_master` | Company master | 03:00 on 1st of month | `staging_jquants.master` |
+| `jquants_master` | Company master | 03:00 on 10th of month | `staging_jquants.master` |
 | `daily_monitoring_dashboard` | Dataform transform | 18:20 weekdays | `mart.report_stock_dashboard` |
 
 ## Key Design Decisions
@@ -62,6 +62,7 @@ Cloud Scheduler (OIDC)
 ├── build_deploy.yaml          # Cloud Build CI/CD pipeline (single source of truth)
 ├── Dockerfile                 # Shared container image for all jobs and services
 ├── requirements.txt           # Python dependencies
+├── package.json               # Dataform Node.js dependencies (@dataform/core)
 ├── dataform.json              # Dataform project configuration
 ├── libs/                      # Shared Python libraries
 │   ├── config.py              # GCP resource naming conventions

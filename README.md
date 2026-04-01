@@ -213,6 +213,20 @@ The `mart.report_stock_dashboard` table is refreshed daily after market close. I
 
 Connect Looker Studio to the `mart_prod.report_stock_dashboard` BigQuery table and set a daily refresh schedule.
 
+## Example Output
+
+The following is an example of what can be built on top of this pipeline. The application (not included in this repository) consumes the BigQuery mart tables and delivers daily analysis reports to Discord.
+
+### Daily Sector Fund Flow Report (Discord)
+
+![Daily sector fund flow report](docs/images/output_sample_daily_report.png)
+
+The example above shows one of several analysis reports delivered each evening after market close. Reports include (but are not limited to):
+
+- **Market summary**: Overall fund flow trends, new money / rotation signals
+- **Sector analysis**: Top inflows/outflows by sector with specific stock highlights
+- **Themes**: Momentum themes active on the day
+
 ## Environment Strategy
 
 | Branch | Environment | BigQuery Datasets |

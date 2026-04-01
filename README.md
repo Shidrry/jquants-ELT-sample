@@ -236,7 +236,3 @@ The example above shows one of several analysis reports delivered each evening a
 | `main` | prod | `staging_jquants_prod`, `pipeline_metadata_prod`, `mart_prod` |
 
 Dev schedulers are automatically paused when a prod deployment runs.
-
-## License
-
-MIT

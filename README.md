@@ -1,8 +1,17 @@
 # jquants-ETL-sample
 
-A production-grade, fully serverless **ELT** pipeline on GCP that ingests daily Japanese stock market data from the [J-Quants API](https://jpx-jquants.com/), stores it in BigQuery, and transforms it with Dataform into a Looker Studio monitoring dashboard — all deployed via Infrastructure as Code and GitOps CI/CD.
+A production-grade, fully serverless **ELT pipeline** on GCP that ingests daily Japanese equity market data from the [J-Quants API](https://jpx-jquants.com/), stages it in BigQuery, and transforms it with Dataform into a Looker Studio monitoring dashboard — all provisioned via Terraform and deployed through a GitOps CI/CD workflow.
 
-The pipeline follows an **ELT** (Extract → Load → Transform) pattern: raw data is extracted from the J-Quants API and loaded as-is into BigQuery staging tables (with only type casting for schema safety), then transformed downstream by Dataform into mart tables.
+The pipeline handles **5 data feeds** across multiple schedules, serves **3,900+ listed equities** on JPX (Prime / Growth / Standard markets), and runs unattended every trading day with statistical data quality monitoring and Discord alerting.
+
+## Technical Highlights
+
+- **Zero-server architecture**: Cloud Run Jobs (batch) + Cloud Run Services (API) + Cloud Workflows (orchestration) — no VMs, no persistent processes, pay-per-execution
+- **Full Infrastructure as Code**: Every GCP resource — IAM, GCS, BigQuery, Artifact Registry, Cloud Build triggers, Dataform, Secret Manager — is declared in Terraform and version-controlled
+- **GitOps multi-environment**: Branch push (`develop` / `main`) is the single deployment trigger; dev and prod are structurally identical, isolated by dataset naming convention
+- **Statistical data quality**: NULL rates are tracked per column per pipeline in `pipeline_metadata.data_quality_metrics` and compared against a 60-day rolling average; anomalies exceeding a 5 percentage-point delta trigger Discord alerts without blocking the pipeline
+- **Idempotent loads**: Daily BigQuery partitions are overwritten on re-run (`WRITE_TRUNCATE`), making backfills and reruns safe by design
+- **Self-healing CI/CD**: Cloud Build deletes Cloud Run / Workflows / Scheduler resources that no longer exist in the repository, preventing orphaned infrastructure drift
 
 ## Architecture
 
@@ -21,45 +30,62 @@ Cloud Scheduler (OIDC)
                                                             Looker Studio Dashboard
 ```
 
+Each pipeline is independently deployable. The orchestration layer (`workflow.yaml`) and the job implementations are colocated per pipeline, so adding a new feed requires only a new directory — no changes to shared infrastructure.
+
 ## Data Pipelines
 
 | Pipeline | Data Source | Schedule (JST) | BigQuery Table |
 |---|---|---|---|
 | `jquants_ohlcv` | Daily OHLCV (bars) | 16:35 weekdays | `staging_jquants.daily_quotes` |
-| `jquants_fins_summary` | Financial summary (速報) | 18:05 weekdays | `staging_jquants.fins_summary` |
-| `jquants_fins_summary_confirmed` | Financial summary (確報) | 01:30 weekdays | `staging_jquants.fins_summary` |
+| `jquants_fins_summary` | Financial summary (preliminary) | 18:05 weekdays | `staging_jquants.fins_summary` |
+| `jquants_fins_summary_confirmed` | Financial summary (confirmed) | 01:30 weekdays | `staging_jquants.fins_summary` |
 | `jquants_earnings_calendar` | Earnings calendar | 19:30 weekdays | `staging_jquants.earnings_calendar` |
 | `jquants_master` | Company master | 03:00 on 10th of month | `staging_jquants.master` |
 | `daily_monitoring_dashboard` | Dataform transform | 18:20 weekdays | `mart.report_stock_dashboard` |
 
-`jquants_fins_summary_confirmed` は `jquants_fins_summary` の ingest/load ジョブを再利用し、確報データで同じテーブルを上書きする。`check_quality` ジョブのみを独自に持つ。
+`jquants_fins_summary_confirmed` reuses the ingest/load jobs from `jquants_fins_summary` and overwrites the same table with confirmed (revised) financial figures. It carries only its own `check_quality` job.
 
 ## Key Design Decisions
 
-- **Serverless**: Cloud Run Jobs + Cloud Workflows + Cloud Scheduler — zero persistent servers, pay-per-use
-- **GitOps CI/CD**: `build_deploy.yaml` is the single source of truth. Push to `develop` → dev deploy; push to `main` → prod deploy
-- **Declarative pipelines**: Each `workflow.yaml` defines its own schedule and jobs via `__metadata__`. Adding a new pipeline requires only a new `workflow.yaml`
-- **Two-stage BigQuery load**: GCS Parquet → temp table → CAST SQL → final partitioned table. Ensures type safety without schema management overhead
-- **Market-aware scheduling**: Workflows skip execution on non-business days by checking the J-Quants calendar API
-- **Self-healing cleanup**: Cloud Build deletes Cloud Run / Workflows / Scheduler resources that no longer exist in the repository
-- **Secrets in Secret Manager**: Zero credentials in the repository. All API keys and tokens stored in GCP Secret Manager, accessed at runtime
-- **Idempotent loads**: Daily partitions are overwritten on re-run (WRITE_TRUNCATE), making backfills safe
-- **Data quality monitoring**: Each ingest pipeline runs a `check_quality` job after load. NULL rates are recorded in `pipeline_metadata.data_quality_metrics` and compared against a 60-day rolling average. Anomalies and row-count drops (< 80% of previous business day) trigger Discord alerts without failing the pipeline. The `ohlcv` pipeline additionally retries up to 6 times (5-minute intervals) when 0 records are returned, to tolerate J-Quants API update delays.
+### ELT over ETL — type safety without schema coupling
+Raw data is landed in GCS as Parquet without transformation, then loaded to BigQuery in two stages: (1) GCS Parquet → temporary table using type inference, (2) a CAST SQL query writes to the final date-partitioned table with explicit types. The temp table is always deleted in a `finally` block. This decouples schema evolution from ingestion: upstream type changes surface as explicit cast failures rather than silent data corruption.
+
+### Market-aware scheduling via API
+Every workflow begins with a call to the J-Quants trading calendar API. If the target date is a non-business day, the workflow exits early. This eliminates the need to maintain a holiday calendar and keeps schedules simple (daily cron regardless of market calendar).
+
+### Retry logic for API update latency
+The OHLCV pipeline retries up to 6 times at 5-minute intervals when 0 records are returned. The J-Quants API for daily prices is updated after market close and the exact timing varies; polling is safer than a fixed delay.
+
+### Statistical anomaly detection — not just null checks
+Each `check_quality` job computes per-column NULL rates for the day's load and compares them against the 60-day rolling average stored in `pipeline_metadata.data_quality_metrics`. Anomalies are flagged when the delta exceeds 5 percentage points. Row counts are separately compared against the previous business day (threshold: 80%). Both checks alert via Discord without failing the pipeline — they are warnings, not blockers.
+
+Two check modes are implemented:
+- **`run_anomaly_check`**: statistical comparison against historical baseline (used for feeds where some NULLs are structurally expected)
+- **`run_zero_tolerance_check`**: any NULL is an alert (used for feeds where the schema guarantees completeness)
+
+### API version migration with zero downstream impact
+The J-Quants v2 API uses abbreviated column names (`O`, `H`, `L`, `C`, `Vo`, etc.). The ingestion layer maps these back to the v1 full names (`Open`, `High`, `Low`, `Close`, `Volume`, etc.) before writing to Parquet — keeping the BigQuery schema and all downstream SQL unchanged across the API version migration.
+
+### Secrets and auth — zero credentials in the repository
+All API keys and tokens are stored in GCP Secret Manager and fetched at runtime. Cloud Scheduler authenticates to Cloud Run via OIDC (no service account key files). The workflow dispatcher validates an allowlist of permitted workflow names before forwarding triggers, preventing arbitrary execution via the HTTP endpoint.
+
+### Declarative pipeline registration
+Each pipeline's `workflow.yaml` carries a `__metadata__` block that declares its own Cloud Scheduler cron expression and job list. The CI/CD pipeline reads these metadata blocks and creates/updates/deletes Scheduler jobs and Cloud Workflows accordingly. Adding a new pipeline requires no changes outside its own directory.
 
 ## GCP Services Used
 
 | Service | Role |
 |---|---|
-| Cloud Run (Services) | `market_open` health check, `workflow_dispatcher` trigger bridge |
-| Cloud Run (Jobs) | Per-pipeline ingest and load jobs |
-| Cloud Workflows | Orchestration, market-open gating, error handling |
+| Cloud Run (Services) | `market_open` trading calendar check, `workflow_dispatcher` trigger bridge |
+| Cloud Run (Jobs) | Per-pipeline ingest, load, and quality check jobs |
+| Cloud Workflows | Orchestration, market-open gating, retry logic, error handling |
 | Cloud Scheduler | Cron triggers via OIDC to dispatcher |
-| Cloud Storage | Data lake (GCS Parquet, partitioned by date) |
-| BigQuery | Staging tables (partitioned) + Dataform mart |
-| Dataform | SQL transformations for reporting |
-| Artifact Registry | Docker image registry |
-| Cloud Build | CI/CD pipeline |
-| Secret Manager | API keys and tokens |
+| Cloud Storage | Data lake — Parquet files partitioned by date |
+| BigQuery | Staging tables (date-partitioned) + Dataform mart + pipeline metadata |
+| Dataform | SQL transformations and mart table management |
+| Artifact Registry | Docker image registry (shared image for all jobs) |
+| Cloud Build | CI/CD pipeline — build, deploy, and resource cleanup |
+| Secret Manager | API keys and tokens (zero credentials in repo) |
 
 ## Repository Structure
 
@@ -195,11 +221,11 @@ git push origin develop
 
 Cloud Build will:
 1. Build and push the Docker image to Artifact Registry
-2. Deploy Cloud Run Services (market_open, workflow_dispatcher)
+2. Deploy Cloud Run Services (`market_open`, `workflow_dispatcher`)
 3. Deploy Cloud Run Jobs for each pipeline step
 4. Deploy Cloud Workflows with rendered YAML
 5. Create/update Cloud Scheduler jobs
-6. Clean up orphaned resources
+6. Clean up orphaned resources no longer present in the repository
 
 ### Backfill
 

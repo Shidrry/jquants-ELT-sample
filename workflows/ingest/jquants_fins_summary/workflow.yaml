@@ -1,14 +1,27 @@
 __metadata__:
   schedule:
-    cron: "30 19 * * *"
+    cron: "05 18 * * *"
     time_zone: "Asia/Tokyo"
     argument:
       args: {}
   jobs:
     - id: ingest_to_gcs
       py: workflows/ingest/jquants_fins_summary/job__ingest_to_gcs.py
+      # Cloud Run Jobs は gen2 固定のため memory >= 512Mi, cpu >= 1 が下限
+      memory: 512Mi
+      cpu: "1"
+      timeout: 300
     - id: load_to_bigquery
       py: workflows/ingest/jquants_fins_summary/job__load_to_bigquery.py
+      # Cloud Run Jobs は gen2 固定のため memory >= 512Mi, cpu >= 1 が下限
+      memory: 512Mi
+      cpu: "1"
+      timeout: 300
+    - id: check_quality
+      py: workflows/ingest/jquants_fins_summary/job__check_quality.py
+      memory: 512Mi
+      cpu: "1"
+      timeout: 300
 
 main:
   params: [args]
@@ -33,6 +46,14 @@ main:
     - run_pipeline:
         try:
           steps:
+            # ---- ingest & 件数確認のリトライループ ----
+            # fins/summary は営業日でも開示ゼロの日がある（0 件は正常ケース）。
+            # 10 分間隔で最大 3 回リトライ（最大 30 分）し、全て 0 件なら
+            # Discord に通知した上で正常終了する。
+            - init_retry:
+                assign:
+                  - retry_count: 0
+
             - run_job__ingest_to_gcs:
                 call: googleapis.run.v2.projects.locations.jobs.run
                 args:
@@ -58,6 +79,39 @@ main:
                               value: ENV_PLACEHOLDER
                             - name: LOGICAL_DATE
                               value: ${logical_date}
+
+            - count_records:
+                call: googleapis.bigquery.v2.jobs.query
+                args:
+                  projectId: ${project_id}
+                  body:
+                    query: '${"SELECT COUNT(*) AS cnt FROM `" + project_id + ".staging_jquants_ENV_PLACEHOLDER.fins_summary` WHERE DiscDate = DATE(''" + logical_date + "'')"}'
+                    useLegacySql: false
+                result: count_resp
+
+            - parse_count:
+                assign:
+                  - record_count: ${int(count_resp.rows[0].f[0].v)}
+
+            - check_record_count:
+                switch:
+                  - condition: ${record_count > 0}
+                    next: run_quality_check
+                  - condition: ${retry_count >= 3}
+                    next: notify_zero_records
+                  - condition: ${true}
+                    next: retry_wait
+
+            - retry_wait:
+                call: sys.sleep
+                args:
+                  seconds: 600
+
+            - retry_increment:
+                assign:
+                  - retry_count: ${retry_count + 1}
+                next: run_job__ingest_to_gcs
+
         except:
           as: e
           steps:
@@ -82,3 +136,41 @@ main:
                       + "\n```"}
             - reraise:
                 raise: ${e}
+
+    # メインパイプラインの try 外に配置。データ品質警告（Discord 通知）は非 fatal だが、
+    # 処理エラー（BQ 接続失敗・コードバグ等）はジョブ失敗としてワークフローを失敗させる。
+    # notify_zero_records へのフォールスルーを防ぐため end する。
+    - run_quality_check:
+        call: googleapis.run.v2.projects.locations.jobs.run
+        args:
+          name: ${base_job + "jquants-fins-summary--check-quality"}
+          body:
+            overrides:
+              containerOverrides:
+                - env:
+                    - name: ENV_NAME
+                      value: ENV_PLACEHOLDER
+                    - name: LOGICAL_DATE
+                      value: ${logical_date}
+    - qc_end:
+        next: end
+
+    # try の外に配置。Discord 通知失敗が pipeline 成否に影響しないようにする。
+    - notify_zero_records:
+        try:
+          call: http.post
+          args:
+            url: ${discord_webhook_url}
+            body:
+              content: >-
+                ${"⚠️ **jquants_fins_summary 0件で終了** [ENV_PLACEHOLDER]\n"
+                + "project: `" + project_id + "`\n"
+                + "date: `" + logical_date + "`\n"
+                + "10 分 × 3 回リトライ後も 0 件のため正常終了しました。"}
+        except:
+          as: notify_err
+          steps:
+            - log_notify_failure:
+                call: sys.log
+                args:
+                  text: '${"Zero-records Discord notify failed: " + json.encode_to_string(notify_err)}'

@@ -1,172 +1,101 @@
 config {
-  type: "incremental",
+  type: "table",
   schema: env.martDataset,
-  uniqueKey: ["trade_date", "code"],
-  description: "日次株価基本指標（enriched）。価格・出来高指標、各種フラグ、銘柄マスタ属性、時価総額、財務開示日、決算コンテキストを提供する。プライム・グロース・スタンダード市場のみ対象。mart_stock_dashboard から参照される。"
+  description: "日次株価基本指標（enriched）。価格・出来高指標、各種フラグ、銘柄マスタ属性、時価総額、財務開示日、決算コンテキストを提供する。プライム・グロース・スタンダード市場のみ対象。"
 }
 
 /*
-  ウィンドウ計算:
-    - LAG・ストップ高安5日窓は全銘柄の過去110日分で計算後、logical_date + 市場フィルタで絞り込む
-    - 売買代金ランキングは市場フィルタ適用後の宇宙で計算（フィルタ後全銘柄中）
+  int_daily_price_metrics（価格・技術指標 layer）をベースに、
+  銘柄マスタ・財務情報・決算カレンダーを各 trade_date 時点で LEFT JOIN して結合する。
 
-  時価総額:
-    - fins_summary の ShOutFY（期末発行済株式数）- TrShFY（期末自己株式数）= 実質流通株式数
-    - 時価総額（円）= close_price × (ShOutFY - TrShFY)
-    - 百万円換算: ÷ 1,000,000
-    - BPS/Eq 方式と異なり IFRS・米国基準でも欠損しない
+  各 trade_date 時点の参照データ:
+    - latest_master    : valid_from/valid_to で時点スナップショットを参照
+    - latest_fins      : DiscDate < trade_date の最新「決算短信」開示を参照
+    - latest_revisions : DiscDate < trade_date の最新「修正開示」を参照
+    - announcement_history / next_earnings : logical_date 以前の決算カレンダーから次回決算日を算出
 
-  カラム追加時のガイド:
-    - OHLCV 由来のフラグ・指標 → with_metrics または with_raw_flags に追記
-    - マスタ由来の属性          → latest_master CTE と final SELECT に追記
-    - 財務情報由来              → latest_fins CTE と final SELECT に追記
-    - 決算カレンダー由来        → announcement_history / next_earnings に追記
-    - 直近決算日は fins_summary.DiscDate を使用（earnings_calendar より確実）
-    - カラム追加後は --full-refresh で過去データをバックフィルすること
+  売買代金ランキングはここで計算（市場フィルタ後の全銘柄中）
 */
 
-WITH source AS (
-  SELECT
-    Date AS trade_date,
-    Code AS code,
-    Open               AS open_price,
-    High               AS high_price,
-    Low                AS low_price,
-    Close              AS close_price,
-    Volume             AS volume,
-    TurnoverValue      AS turnover_value,
-    AdjustmentClose    AS adj_close,
-    AdjustmentVolume   AS adj_volume,
-    -- ストップ高・ストップ安フラグ（'1' = 発生）
-    UpperLimit = '1'   AS is_stop_high,
-    LowerLimit = '1'   AS is_stop_low
-  FROM ${ref("daily_quotes")}
-  WHERE Date >= DATE_SUB(CAST('${env.logical_date}' AS DATE), INTERVAL 110 DAY)
-    AND Date <= CAST('${env.logical_date}' AS DATE)
-),
+WITH
 
-with_lags AS (
-  SELECT
-    *,
-    -- 前n営業日の調整後終値
-    LAG(adj_close, 1)  OVER (PARTITION BY code ORDER BY trade_date) AS prev_1d_adj_close,
-    LAG(adj_close, 5)  OVER (PARTITION BY code ORDER BY trade_date) AS prev_5d_adj_close,
-    LAG(adj_close, 20) OVER (PARTITION BY code ORDER BY trade_date) AS prev_20d_adj_close,
-    LAG(adj_close, 60) OVER (PARTITION BY code ORDER BY trade_date) AS prev_60d_adj_close,
-    -- 前n営業日の売買代金
-    LAG(turnover_value, 1)  OVER (PARTITION BY code ORDER BY trade_date) AS prev_1d_turnover,
-    LAG(turnover_value, 5)  OVER (PARTITION BY code ORDER BY trade_date) AS prev_5d_turnover,
-    LAG(turnover_value, 20) OVER (PARTITION BY code ORDER BY trade_date) AS prev_20d_turnover,
-    LAG(turnover_value, 60) OVER (PARTITION BY code ORDER BY trade_date) AS prev_60d_turnover,
-    -- 前日の調整後出来高
-    LAG(adj_volume, 1)  OVER (PARTITION BY code ORDER BY trade_date) AS prev_1d_adj_volume
-  FROM source
-),
-
-with_metrics AS (
-  SELECT
-    trade_date, code,
-    open_price, high_price, low_price, close_price,
-    volume, turnover_value, adj_close, adj_volume,
-    is_stop_high, is_stop_low,
-    -- 陽線（close >= open）か陰線か
-    close_price >= open_price AS is_bullish,
-    -- 前n営業日比 株価変化率（小数。例: 0.05 = +5%）
-    SAFE_DIVIDE(adj_close - prev_1d_adj_close,  prev_1d_adj_close)  AS price_pct_change_1d,
-    SAFE_DIVIDE(adj_close - prev_5d_adj_close,  prev_5d_adj_close)  AS price_pct_change_5d,
-    SAFE_DIVIDE(adj_close - prev_20d_adj_close, prev_20d_adj_close) AS price_pct_change_20d,
-    SAFE_DIVIDE(adj_close - prev_60d_adj_close, prev_60d_adj_close) AS price_pct_change_60d,
-    -- 前n営業日比 売買代金増加率（小数）
-    SAFE_DIVIDE(turnover_value - prev_1d_turnover,  prev_1d_turnover)  AS turnover_pct_change_1d,
-    SAFE_DIVIDE(turnover_value - prev_5d_turnover,  prev_5d_turnover)  AS turnover_pct_change_5d,
-    SAFE_DIVIDE(turnover_value - prev_20d_turnover, prev_20d_turnover) AS turnover_pct_change_20d,
-    SAFE_DIVIDE(turnover_value - prev_60d_turnover, prev_60d_turnover) AS turnover_pct_change_60d,
-    -- 前日比 調整後出来高増加率（小数）
-    SAFE_DIVIDE(adj_volume - prev_1d_adj_volume, prev_1d_adj_volume) AS volume_pct_change_1d
-  FROM with_lags
-),
-
--- ストップ高安の5日窓フラグはここで計算（全銘柄・全期間が必要）
--- turnover_rank は市場フィルタ後の宇宙でランクしたいため、最終 SELECT で計算する
-with_raw_flags AS (
-  SELECT
-    *,
-    COUNTIF(is_stop_high) OVER (
-      PARTITION BY code ORDER BY trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
-    ) > 0 AS had_stop_high_5d,
-    COUNTIF(is_stop_low) OVER (
-      PARTITION BY code ORDER BY trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
-    ) > 0 AS had_stop_low_5d
-  FROM with_metrics
-),
-
--- 銘柄マスタ: logical_date 以前の最新スナップショット（月次取得）
--- パーティションキーは logical_date（APIレスポンスの Date は休日の場合に翌営業日になるため）
+-- 各 trade_date 時点の最新銘柄マスタスナップショット（monthly ingest）
+-- LEAD で valid_to を計算し、trade_date がその有効期間内の行を INNER JOIN で参照する
 latest_master AS (
-  SELECT Code AS code, CoName AS company_name, S33Nm AS sector_33, MktNm AS market_division
+  SELECT
+    Code AS code,
+    CoName AS company_name,
+    S33Nm AS sector_33,
+    MktNm AS market_division,
+    logical_date AS valid_from,
+    LEAD(logical_date) OVER (PARTITION BY Code ORDER BY logical_date) AS valid_to
   FROM ${ref("master")}
-  WHERE logical_date = (
-    SELECT MAX(logical_date) FROM ${ref("master")}
-    WHERE logical_date <= CAST('${env.logical_date}' AS DATE)
-  )
 ),
 
--- 財務情報: logical_date 以前の最新「決算短信」開示から株式数・開示日を取得
--- DocType LIKE '%FinancialStatements%' で決算短信のみに絞り込み、
--- 業績予想・配当予想の修正（EarnForecastRevision / DividendForecastRevision 等）を除外する
--- ARRAY_AGG(... ORDER BY ... LIMIT 1)[SAFE_OFFSET(0)]: 最大 DiscDate に対応する値を取得する BQ 標準パターン
+-- 各 trade_date 時点で確報済みの最新「決算短信」開示（ShOutFY / TrShFY から実質流通株式数を算出）
+-- DiscDate < trade_date で当日分を除外し、DocType で修正開示を除く
 latest_fins AS (
   SELECT
-    Code AS code,
-    MAX(DiscDate) AS last_disclosure_date,
-    -- 実質流通株式数 = 期末発行済株式数 - 期末自己株式数
+    base.trade_date,
+    base.code,
+    MAX(f.DiscDate) AS last_disclosure_date,
     ARRAY_AGG(
-      ShOutFY - COALESCE(TrShFY, 0)
-      ORDER BY DiscDate DESC LIMIT 1
+      f.ShOutFY - COALESCE(f.TrShFY, 0)
+      ORDER BY f.DiscDate DESC LIMIT 1
     )[SAFE_OFFSET(0)] AS latest_net_shares
-  FROM ${ref("fins_summary")}
-  WHERE DiscDate IS NOT NULL
-    AND DiscDate <= CAST('${env.logical_date}' AS DATE)
-    AND DocType LIKE '%FinancialStatements%'
-  GROUP BY Code
+  FROM (SELECT DISTINCT trade_date, code FROM ${ref("int_daily_price_metrics")}) AS base
+  LEFT JOIN ${ref("fins_summary")} AS f
+    ON f.Code = base.code
+    AND f.DiscDate IS NOT NULL
+    AND f.DiscDate < base.trade_date
+    AND f.DocType LIKE '%FinancialStatements%'
+  GROUP BY base.trade_date, base.code
 ),
 
--- 業績予想・配当予想の修正開示: 最新の修正開示日
--- 対象: EarnForecastRevision / DividendForecastRevision / REIT 系修正
+-- 各 trade_date 時点の最新修正開示日（業績予想・配当予想の修正）
 latest_revisions AS (
   SELECT
-    Code AS code,
-    MAX(DiscDate) AS last_revision_date
-  FROM ${ref("fins_summary")}
-  WHERE DiscDate IS NOT NULL
-    AND DiscDate <= CAST('${env.logical_date}' AS DATE)
-    AND DocType NOT LIKE '%FinancialStatements%'
-  GROUP BY Code
+    base.trade_date,
+    base.code,
+    MAX(f.DiscDate) AS last_revision_date
+  FROM (SELECT DISTINCT trade_date, code FROM ${ref("int_daily_price_metrics")}) AS base
+  LEFT JOIN ${ref("fins_summary")} AS f
+    ON f.Code = base.code
+    AND f.DiscDate IS NOT NULL
+    AND f.DiscDate < base.trade_date
+    AND f.DocType NOT LIKE '%FinancialStatements%'
+  GROUP BY base.trade_date, base.code
 ),
 
--- 決算発表日一覧（日次蓄積の全期間）
+-- 決算発表日一覧（logical_date 以前の最新スナップショット）
 announcement_history AS (
   SELECT DISTINCT
-    Code               AS code,
+    Code AS code,
     Date AS announcement_date,
-    FQ   AS earnings_quarter
+    FQ   AS earnings_quarter,
+    execution_date
   FROM ${ref("earnings_calendar")}
   WHERE Date IS NOT NULL
+    AND execution_date < CAST('${env.logical_date}' AS DATE)
 ),
 
--- 次回決算予定日: earnings_calendar の蓄積から算出（logical_date の行のみ）
--- 直近決算日は fins_summary.DiscDate（lf.last_disclosure_date）を使用するため CTE 不要
+-- 各 trade_date の次回決算予定日
 next_earnings AS (
-  SELECT w.trade_date, w.code, MIN(a.announcement_date) AS next_earnings_date
-  FROM with_raw_flags AS w
-  LEFT JOIN announcement_history AS a ON w.code = a.code AND a.announcement_date > w.trade_date
-  WHERE w.trade_date = CAST('${env.logical_date}' AS DATE)
-  GROUP BY w.trade_date, w.code
+  SELECT
+    p.trade_date,
+    p.code,
+    MIN(a.announcement_date) AS next_earnings_date
+  FROM ${ref("int_daily_price_metrics")} AS p
+  LEFT JOIN announcement_history AS a
+    ON p.code = a.code
+    AND a.execution_date < p.trade_date
+    AND a.announcement_date >= p.trade_date
+  GROUP BY p.trade_date, p.code
 )
 
 SELECT
-  w.trade_date,
-  w.code,
+  p.trade_date,
+  p.code,
 
   -- 銘柄マスタ属性
   lm.company_name,
@@ -174,65 +103,76 @@ SELECT
   lm.market_division,
 
   -- 価格情報
-  w.open_price,
-  w.high_price,
-  w.low_price,
-  w.close_price,
-  w.adj_close,
+  p.open_price,
+  p.high_price,
+  p.low_price,
+  p.close_price,
+  p.adj_close,
+  p.adjustment_factor,
+  p.adj_close_api,
 
   -- 出来高・売買代金
-  w.volume,
-  w.adj_volume,
-  w.turnover_value,
+  p.volume,
+  p.adj_volume,
+  p.turnover_value,
 
   -- 売買代金ランキング（市場フィルタ後の全銘柄中。1 = 最大）
-  -- INNER JOIN 後・WHERE 後の行集合でランクするため最終 SELECT で計算
-  DENSE_RANK() OVER (PARTITION BY w.trade_date ORDER BY w.turnover_value DESC NULLS LAST) AS turnover_rank,
+  DENSE_RANK() OVER (PARTITION BY p.trade_date ORDER BY p.turnover_value DESC NULLS LAST) AS turnover_rank,
 
   -- 時価総額（百万円）= close_price × (ShOutFY - TrShFY) / 1,000,000
-  SAFE_DIVIDE(w.close_price * lf.latest_net_shares, 1000000) AS market_cap_million_jpy,
+  SAFE_DIVIDE(p.close_price * lf.latest_net_shares, 1000000) AS market_cap_million_jpy,
 
-  -- 前n営業日比 株価変化率（小数）
-  w.price_pct_change_1d,
-  w.price_pct_change_5d,
-  w.price_pct_change_20d,
-  w.price_pct_change_60d,
+  -- 前n営業日比 株価変化率
+  p.price_pct_change_1d,
+  p.price_pct_change_5d,
+  p.price_pct_change_20d,
+  p.price_pct_change_60d,
 
-  -- 前n営業日比 売買代金増加率（小数）
-  w.turnover_pct_change_1d,
-  w.turnover_pct_change_5d,
-  w.turnover_pct_change_20d,
-  w.turnover_pct_change_60d,
+  -- 前n営業日比 売買代金増加率
+  p.turnover_pct_change_1d,
+  p.turnover_pct_change_5d,
+  p.turnover_pct_change_20d,
+  p.turnover_pct_change_60d,
 
-  -- 前日比 調整後出来高増加率（小数）
-  w.volume_pct_change_1d,
+  -- 前日比 調整後出来高増加率
+  p.volume_pct_change_1d,
 
-  -- ---- フラグ ----
-  w.is_bullish,
-  w.had_stop_high_5d,
-  w.had_stop_low_5d,
+  -- フラグ
+  p.is_bullish,
+  p.had_stop_high_5d,
+  p.had_stop_low_5d,
+
+  -- 長期窓指標（前日までの最高値・平均売買代金）
+  p.high_252d_prior,
+  p.high_126d_prior,
+  p.avg_prior_20d_turnover,
+  p.adj_close > p.high_252d_prior AS is_new_252d_high,
+  p.adj_close > p.high_126d_prior AS is_new_126d_high,
 
   -- 決算コンテキスト
-  -- 次回予定日: earnings_calendar ベース（3月期・9月期以外は NULL）
   ne.next_earnings_date,
-  DATE_DIFF(ne.next_earnings_date, w.trade_date, DAY) AS days_to_next_earnings,
-  ah_next.earnings_quarter                            AS next_earnings_quarter,
-  -- 直近決算日: fins_summary.DiscDate ベース（全市場対象）
-  lf.last_disclosure_date                               AS last_earnings_date,
-  DATE_DIFF(w.trade_date, lf.last_disclosure_date, DAY)  AS days_since_last_earnings,
-
-  -- 直近修正開示日（業績予想・配当予想の修正）
+  DATE_DIFF(ne.next_earnings_date, p.trade_date, DAY)   AS days_to_next_earnings,
+  ah_next.earnings_quarter                               AS next_earnings_quarter,
+  lf.last_disclosure_date                                AS last_earnings_date,
+  DATE_DIFF(p.trade_date, lf.last_disclosure_date, DAY)  AS days_since_last_earnings,
   lr.last_revision_date,
-  DATE_DIFF(w.trade_date, lr.last_revision_date, DAY)    AS days_since_last_revision
+  DATE_DIFF(p.trade_date, lr.last_revision_date, DAY)    AS days_since_last_revision
 
-FROM with_raw_flags AS w
+FROM ${ref("int_daily_price_metrics")} AS p
 INNER JOIN latest_master AS lm
-  ON w.code = lm.code
+  ON p.code = lm.code
+  AND p.trade_date >= lm.valid_from
+  AND (lm.valid_to IS NULL OR p.trade_date < lm.valid_to)
   AND lm.market_division IN ('プライム', 'グロース', 'スタンダード')
-LEFT JOIN latest_fins      AS lf     ON w.code = lf.code
-LEFT JOIN latest_revisions AS lr     ON w.code = lr.code
-LEFT JOIN next_earnings    AS ne     ON w.trade_date = ne.trade_date AND w.code = ne.code
+LEFT JOIN latest_fins AS lf
+  ON p.code = lf.code
+  AND p.trade_date = lf.trade_date
+LEFT JOIN latest_revisions AS lr
+  ON p.code = lr.code
+  AND p.trade_date = lr.trade_date
+LEFT JOIN next_earnings AS ne
+  ON p.trade_date = ne.trade_date
+  AND p.code = ne.code
 LEFT JOIN announcement_history AS ah_next
-  ON w.code = ah_next.code
+  ON p.code = ah_next.code
   AND ne.next_earnings_date = ah_next.announcement_date
-WHERE w.trade_date = CAST('${env.logical_date}' AS DATE)

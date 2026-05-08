@@ -7,8 +7,21 @@ __metadata__:
   jobs:
     - id: ingest_to_gcs
       py: workflows/ingest/jquants_master/job__ingest_to_gcs.py
+      # Cloud Run Jobs は gen2 固定のため memory >= 512Mi, cpu >= 1 が下限
+      memory: 512Mi
+      cpu: "1"
+      timeout: 300
     - id: load_to_bigquery
       py: workflows/ingest/jquants_master/job__load_to_bigquery.py
+      # Cloud Run Jobs は gen2 固定のため memory >= 512Mi, cpu >= 1 が下限
+      memory: 512Mi
+      cpu: "1"
+      timeout: 300
+    - id: check_quality
+      py: workflows/ingest/jquants_master/job__check_quality.py
+      memory: 512Mi
+      cpu: "1"
+      timeout: 300
 
 main:
   params: [args]
@@ -82,3 +95,18 @@ main:
                       + "\n```"}
             - reraise:
                 raise: ${e}
+
+    # メインパイプラインの try 外に配置。データ品質警告（Discord 通知）は非 fatal だが、
+    # 処理エラー（BQ 接続失敗・コードバグ等）はジョブ失敗としてワークフローを失敗させる。
+    - run_quality_check:
+        call: googleapis.run.v2.projects.locations.jobs.run
+        args:
+          name: ${base_job + "jquants-master--check-quality"}
+          body:
+            overrides:
+              containerOverrides:
+                - env:
+                    - name: ENV_NAME
+                      value: ENV_PLACEHOLDER
+                    - name: LOGICAL_DATE
+                      value: ${logical_date}

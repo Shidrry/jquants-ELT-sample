@@ -1,0 +1,150 @@
+config {
+  type: "table",
+  schema: env.martDataset,
+  description: "日次株価・技術指標（price layer）。分割調整・LAG・変化率・フラグ・長期窓指標を計算する。int_daily_stock_metrics から参照される。"
+}
+
+/*
+  ウィンドウ計算:
+    - source は出力範囲（400暦日）＋最大ウィンドウ幅（252日）＋余裕 = 700暦日を取得
+    - 最終 WHERE で出力を logical_date 起点400暦日に絞り、ウィンドウ暖気行を除外する
+    - 売買代金ランキングは市場フィルタ後の宇宙で計算するため int_daily_stock_metrics 側で算出
+
+  株式分割対応（jquants_api_v2/調整済み株価の計算方法について 参照）:
+    CumAdj[D] = 日付 D より未来にある AdjustmentFactor の積（D 自身は含まない）
+    AdjC  = Close × CumAdj   （価格は乗算）
+    AdjVo = Volume ÷ CumAdj  （出来高は除算）
+    → 権利落ち日自身は CumAdj=1.0 になり、それより過去の行にのみ係数が効く
+*/
+
+WITH source AS (
+  SELECT
+    Date AS trade_date,
+    Code AS code,
+    Open             AS open_price,
+    High             AS high_price,
+    Low              AS low_price,
+    Close            AS close_price,
+    Volume           AS volume,
+    TurnoverValue    AS turnover_value,
+    AdjustmentFactor AS adjustment_factor,  -- 権利落ち日のみ ≠ 1.0
+    AdjustmentClose  AS adj_close_api,      -- API 返却値（目視確認用）
+    UpperLimit = '1' AS is_stop_high,
+    LowerLimit = '1' AS is_stop_low
+  FROM ${ref("daily_quotes")}
+  WHERE Date >= DATE_SUB(CAST('${env.logical_date}' AS DATE), INTERVAL 700 DAY)
+    AND Date <= CAST('${env.logical_date}' AS DATE)
+),
+
+with_split_adj AS (
+  SELECT
+    trade_date,
+    code,
+    open_price,
+    high_price,
+    low_price,
+    close_price,
+    volume,
+    turnover_value,
+    adjustment_factor,
+    adj_close_api,
+    is_stop_high,
+    is_stop_low,
+    ROUND(
+      close_price * COALESCE(
+        EXP(SUM(LN(NULLIF(adjustment_factor, 1.0))) OVER (
+          PARTITION BY code
+          ORDER BY trade_date ASC
+          ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING
+        )),
+        1.0
+      ),
+      2
+    ) AS adj_close,
+    ROUND(
+      SAFE_DIVIDE(
+        volume,
+        COALESCE(
+          EXP(SUM(LN(NULLIF(adjustment_factor, 1.0))) OVER (
+            PARTITION BY code
+            ORDER BY trade_date ASC
+            ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING
+          )),
+          1.0
+        )
+      ),
+      0
+    ) AS adj_volume
+  FROM source
+),
+
+with_lags AS (
+  SELECT
+    *,
+    LAG(adj_close, 1)       OVER (PARTITION BY code ORDER BY trade_date) AS prev_1d_adj_close,
+    LAG(adj_close, 5)       OVER (PARTITION BY code ORDER BY trade_date) AS prev_5d_adj_close,
+    LAG(adj_close, 20)      OVER (PARTITION BY code ORDER BY trade_date) AS prev_20d_adj_close,
+    LAG(adj_close, 60)      OVER (PARTITION BY code ORDER BY trade_date) AS prev_60d_adj_close,
+    LAG(turnover_value, 1)  OVER (PARTITION BY code ORDER BY trade_date) AS prev_1d_turnover,
+    LAG(turnover_value, 5)  OVER (PARTITION BY code ORDER BY trade_date) AS prev_5d_turnover,
+    LAG(turnover_value, 20) OVER (PARTITION BY code ORDER BY trade_date) AS prev_20d_turnover,
+    LAG(turnover_value, 60) OVER (PARTITION BY code ORDER BY trade_date) AS prev_60d_turnover,
+    LAG(adj_volume, 1)      OVER (PARTITION BY code ORDER BY trade_date) AS prev_1d_adj_volume
+  FROM with_split_adj
+),
+
+with_metrics AS (
+  SELECT
+    trade_date,
+    code,
+    open_price,
+    high_price,
+    low_price,
+    close_price,
+    volume,
+    turnover_value,
+    adj_close,
+    adj_volume,
+    adjustment_factor,
+    adj_close_api,
+    is_stop_high,
+    is_stop_low,
+    close_price >= open_price AS is_bullish,
+    SAFE_DIVIDE(adj_close - prev_1d_adj_close,  prev_1d_adj_close)  AS price_pct_change_1d,
+    SAFE_DIVIDE(adj_close - prev_5d_adj_close,  prev_5d_adj_close)  AS price_pct_change_5d,
+    SAFE_DIVIDE(adj_close - prev_20d_adj_close, prev_20d_adj_close) AS price_pct_change_20d,
+    SAFE_DIVIDE(adj_close - prev_60d_adj_close, prev_60d_adj_close) AS price_pct_change_60d,
+    SAFE_DIVIDE(turnover_value - prev_1d_turnover,  prev_1d_turnover)  AS turnover_pct_change_1d,
+    SAFE_DIVIDE(turnover_value - prev_5d_turnover,  prev_5d_turnover)  AS turnover_pct_change_5d,
+    SAFE_DIVIDE(turnover_value - prev_20d_turnover, prev_20d_turnover) AS turnover_pct_change_20d,
+    SAFE_DIVIDE(turnover_value - prev_60d_turnover, prev_60d_turnover) AS turnover_pct_change_60d,
+    SAFE_DIVIDE(adj_volume - prev_1d_adj_volume, prev_1d_adj_volume) AS volume_pct_change_1d
+  FROM with_lags
+),
+
+-- ストップ高安フラグ（5日窓）と長期窓指標（252日/126日/20日）
+-- 当日を含めない PRIOR 範囲で計算（新高値・出来高基準値の判定に使用）
+with_flags AS (
+  SELECT
+    *,
+    COUNTIF(is_stop_high) OVER (
+      PARTITION BY code ORDER BY trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
+    ) > 0 AS had_stop_high_5d,
+    COUNTIF(is_stop_low) OVER (
+      PARTITION BY code ORDER BY trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
+    ) > 0 AS had_stop_low_5d,
+    MAX(adj_close) OVER (
+      PARTITION BY code ORDER BY trade_date ROWS BETWEEN 252 PRECEDING AND 1 PRECEDING
+    ) AS high_252d_prior,
+    MAX(adj_close) OVER (
+      PARTITION BY code ORDER BY trade_date ROWS BETWEEN 126 PRECEDING AND 1 PRECEDING
+    ) AS high_126d_prior,
+    AVG(turnover_value) OVER (
+      PARTITION BY code ORDER BY trade_date ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING
+    ) AS avg_prior_20d_turnover
+  FROM with_metrics
+)
+
+SELECT *
+FROM with_flags
+WHERE trade_date >= DATE_SUB(CAST('${env.logical_date}' AS DATE), INTERVAL 400 DAY)

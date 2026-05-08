@@ -1,14 +1,27 @@
 __metadata__:
   schedule:
-    cron: "00 18 * * *"
+    cron: "35 16 * * *"
     time_zone: "Asia/Tokyo"
     argument:
       args: {}
   jobs:
     - id: ingest_to_gcs
       py: workflows/ingest/jquants_ohlcv/job__ingest_to_gcs.py
+      # Cloud Run Jobs は gen2 固定のため memory >= 512Mi, cpu >= 1 が下限
+      memory: 512Mi
+      cpu: "1"
+      timeout: 300
     - id: load_to_bigquery
       py: workflows/ingest/jquants_ohlcv/job__load_to_bigquery.py
+      # Cloud Run Jobs は gen2 固定のため memory >= 512Mi, cpu >= 1 が下限
+      memory: 512Mi
+      cpu: "1"
+      timeout: 300
+    - id: check_quality
+      py: workflows/ingest/jquants_ohlcv/job__check_quality.py
+      memory: 512Mi
+      cpu: "1"
+      timeout: 300
 
 main:
   params: [args]
@@ -52,9 +65,16 @@ main:
             - branch_on_market_open:
                 switch:
                   - condition: ${market_open_resp.body.market_open == true}
-                    next: run_job__ingest_to_gcs
+                    next: init_retry
                   - condition: ${true}
                     next: end
+
+            # ---- ingest & 件数確認のリトライループ ----
+            # bars/daily は営業日なら必ずレコードが返る。0 件の場合は API 更新遅延と判断してリトライ。
+            # API 更新予定 16:30 + 5分 = 16:35 開始、5分間隔で最大 6 回リトライ（最大 30 分）。
+            - init_retry:
+                assign:
+                  - retry_count: 0
 
             - run_job__ingest_to_gcs:
                 call: googleapis.run.v2.projects.locations.jobs.run
@@ -81,6 +101,44 @@ main:
                               value: ENV_PLACEHOLDER
                             - name: LOGICAL_DATE
                               value: ${logical_date}
+
+            - count_records:
+                call: googleapis.bigquery.v2.jobs.query
+                args:
+                  projectId: ${project_id}
+                  body:
+                    query: '${"SELECT COUNT(*) AS cnt FROM `" + project_id + ".staging_jquants_ENV_PLACEHOLDER.daily_quotes` WHERE Date = DATE(''" + logical_date + "'')"}'
+                    useLegacySql: false
+                result: count_resp
+
+            - parse_count:
+                assign:
+                  - record_count: ${int(count_resp.rows[0].f[0].v)}
+
+            - check_record_count:
+                switch:
+                  - condition: ${record_count > 0}
+                    next: run_quality_check
+                  - condition: ${retry_count >= 6}
+                    next: zero_records_timeout
+                  - condition: ${true}
+                    next: retry_wait
+
+            - retry_wait:
+                call: sys.sleep
+                args:
+                  seconds: 300
+
+            - retry_increment:
+                assign:
+                  - retry_count: ${retry_count + 1}
+                next: run_job__ingest_to_gcs
+
+            - zero_records_timeout:
+                raise:
+                  code: 503
+                  message: '${"Zero records after max retries: bars/daily data not available (date=" + logical_date + ")"}'
+
         except:
           as: e
           steps:
@@ -105,3 +163,18 @@ main:
                       + "\n```"}
             - reraise:
                 raise: ${e}
+
+    # メインパイプラインの try 外に配置。データ品質警告（Discord 通知）は非 fatal だが、
+    # 処理エラー（BQ 接続失敗・コードバグ等）はジョブ失敗としてワークフローを失敗させる。
+    - run_quality_check:
+        call: googleapis.run.v2.projects.locations.jobs.run
+        args:
+          name: ${base_job + "jquants-ohlcv--check-quality"}
+          body:
+            overrides:
+              containerOverrides:
+                - env:
+                    - name: ENV_NAME
+                      value: ENV_PLACEHOLDER
+                    - name: LOGICAL_DATE
+                      value: ${logical_date}

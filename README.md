@@ -1,6 +1,8 @@
 # jquants-ETL-sample
 
-A production-grade, fully serverless ETL pipeline on GCP that ingests daily Japanese stock market data from the [J-Quants API](https://jpx-jquants.com/), stores it in BigQuery, and powers a Looker Studio monitoring dashboard — all deployed via Infrastructure as Code and GitOps CI/CD.
+A production-grade, fully serverless **ELT** pipeline on GCP that ingests daily Japanese stock market data from the [J-Quants API](https://jpx-jquants.com/), stores it in BigQuery, and transforms it with Dataform into a Looker Studio monitoring dashboard — all deployed via Infrastructure as Code and GitOps CI/CD.
+
+The pipeline follows an **ELT** (Extract → Load → Transform) pattern: raw data is extracted from the J-Quants API and loaded as-is into BigQuery staging tables (with only type casting for schema safety), then transformed downstream by Dataform into mart tables.
 
 ## Architecture
 
@@ -10,7 +12,8 @@ Cloud Scheduler (OIDC)
         └─► Cloud Workflows
               ├─► market_open (Cloud Run Service) ── skip if market closed
               ├─► ingest_to_gcs  (Cloud Run Job)  ── J-Quants API → GCS Parquet
-              └─► load_to_bigquery (Cloud Run Job) ── GCS → BigQuery (partitioned)
+              ├─► load_to_bigquery (Cloud Run Job) ── GCS → BigQuery (partitioned)
+              └─► check_quality   (Cloud Run Job)  ── NULL rate anomaly check → Discord
                                                         │
                                                    Dataform (triggered after load)
                                                         └─► mart.report_stock_dashboard
@@ -22,12 +25,14 @@ Cloud Scheduler (OIDC)
 
 | Pipeline | Data Source | Schedule (JST) | BigQuery Table |
 |---|---|---|---|
-| `jquants_ohlcv` | Daily OHLCV (bars) | 18:00 weekdays | `staging_jquants.daily_quotes` |
-| `jquants_fins_summary` | Financial summary | 19:30 weekdays | `staging_jquants.fins_summary` |
-| `jquants_fins_summary_confirmed` | Confirmed financials | 01:30 weekdays | `staging_jquants.fins_summary` |
+| `jquants_ohlcv` | Daily OHLCV (bars) | 16:35 weekdays | `staging_jquants.daily_quotes` |
+| `jquants_fins_summary` | Financial summary (速報) | 18:05 weekdays | `staging_jquants.fins_summary` |
+| `jquants_fins_summary_confirmed` | Financial summary (確報) | 01:30 weekdays | `staging_jquants.fins_summary` |
 | `jquants_earnings_calendar` | Earnings calendar | 19:30 weekdays | `staging_jquants.earnings_calendar` |
 | `jquants_master` | Company master | 03:00 on 10th of month | `staging_jquants.master` |
 | `daily_monitoring_dashboard` | Dataform transform | 18:20 weekdays | `mart.report_stock_dashboard` |
+
+`jquants_fins_summary_confirmed` は `jquants_fins_summary` の ingest/load ジョブを再利用し、確報データで同じテーブルを上書きする。`check_quality` ジョブのみを独自に持つ。
 
 ## Key Design Decisions
 
@@ -39,6 +44,7 @@ Cloud Scheduler (OIDC)
 - **Self-healing cleanup**: Cloud Build deletes Cloud Run / Workflows / Scheduler resources that no longer exist in the repository
 - **Secrets in Secret Manager**: Zero credentials in the repository. All API keys and tokens stored in GCP Secret Manager, accessed at runtime
 - **Idempotent loads**: Daily partitions are overwritten on re-run (WRITE_TRUNCATE), making backfills safe
+- **Data quality monitoring**: Each ingest pipeline runs a `check_quality` job after load. NULL rates are recorded in `pipeline_metadata.data_quality_metrics` and compared against a 60-day rolling average. Anomalies and row-count drops (< 80% of previous business day) trigger Discord alerts without failing the pipeline. The `ohlcv` pipeline additionally retries up to 6 times (5-minute intervals) when 0 records are returned, to tolerate J-Quants API update delays.
 
 ## GCP Services Used
 
@@ -68,6 +74,7 @@ Cloud Scheduler (OIDC)
 │   ├── config.py              # GCP resource naming conventions
 │   ├── utils.py               # GCS, Secret Manager, env helpers
 │   ├── utils_bigquery.py      # BigQuery load with 2-stage CAST
+│   ├── utils_data_quality.py  # NULL rate anomaly checks + row count comparison
 │   ├── utils_discord.py       # Discord error notifications
 │   ├── utils_jquants.py       # J-Quants API client (paginated)
 │   └── utils_metadata.py      # Pipeline run metadata recording
@@ -79,7 +86,8 @@ Cloud Scheduler (OIDC)
 │   │   ├── jquants_ohlcv/
 │   │   │   ├── workflow.yaml          # Cloud Workflows definition + schedule metadata
 │   │   │   ├── job__ingest_to_gcs.py  # Fetch from J-Quants API → GCS
-│   │   │   └── job__load_to_bigquery.py # GCS Parquet → BigQuery
+│   │   │   ├── job__load_to_bigquery.py # GCS Parquet → BigQuery
+│   │   │   └── job__check_quality.py  # NULL rate anomaly check + row count alert
 │   │   ├── jquants_fins_summary/
 │   │   ├── jquants_fins_summary_confirmed/
 │   │   ├── jquants_earnings_calendar/

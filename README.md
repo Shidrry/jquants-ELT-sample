@@ -1,4 +1,4 @@
-# jquants-ETL-sample
+# jquants-ELT-sample
 
 A production-grade, fully serverless **ELT pipeline** on GCP that ingests daily Japanese equity market data from the [J-Quants API](https://jpx-jquants.com/), stages it in BigQuery, and transforms it with Dataform into a Looker Studio monitoring dashboard — all provisioned via Terraform and deployed through a GitOps CI/CD workflow.
 
@@ -165,7 +165,7 @@ Each pipeline's `workflow.yaml` carries a `__metadata__` block that declares its
 
 ```bash
 cd terraform/
-./bootstrap.sh gcp-jquants-etl-sample asia-northeast1
+./bootstrap.sh gcp-jquants-elt-sample asia-northeast1
 ```
 
 This creates the GCS state bucket, generates `terraform.tfvars` from the template, and runs `terraform init`.
@@ -175,9 +175,9 @@ This creates the GCS state bucket, generates `terraform.tfvars` from the templat
 Edit `terraform/terraform.tfvars`:
 
 ```hcl
-project_id      = "gcp-jquants-etl-sample"
+project_id      = "gcp-jquants-elt-sample"
 region          = "asia-northeast1"
-github_repo_url = "https://github.com/<YOUR_OWNER>/jquants-ETL-sample.git"
+github_repo_url = "https://github.com/<YOUR_OWNER>/jquants-ELT-sample.git"
 ```
 
 ### 3. Apply infrastructure
@@ -196,19 +196,19 @@ This provisions all GCP resources: service accounts, IAM roles, GCS buckets, Big
 # J-Quants API key (required)
 echo -n "YOUR_JQUANTS_API_KEY" | \
   gcloud secrets versions add jquants-api-key \
-  --project=gcp-jquants-etl-sample \
+  --project=gcp-jquants-elt-sample \
   --data-file=-
 
 # Discord webhook for error notifications (required)
 echo -n "<YOUR_DISCORD_WEBHOOK_URL>" | \
   gcloud secrets versions add discord-webhook-url \
-  --project=gcp-jquants-etl-sample \
+  --project=gcp-jquants-elt-sample \
   --data-file=-
 
 # GitHub token for Dataform Git sync (required)
 echo -n "<YOUR_GITHUB_PERSONAL_ACCESS_TOKEN>" | \
   gcloud secrets versions add dataform-github \
-  --project=gcp-jquants-etl-sample \
+  --project=gcp-jquants-elt-sample \
   --data-file=-
 ```
 

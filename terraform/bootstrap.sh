@@ -53,7 +53,7 @@ echo "Versioning enabled on state bucket."
 if [ ! -f "terraform.tfvars" ]; then
   cp terraform.tfvars.template terraform.tfvars
   # Replace placeholder with actual project ID
-  sed -i "s|gcp-jquants-etl-sample|${PROJECT_ID}|g" terraform.tfvars
+  sed -i "s|gcp-jquants-elt-sample|${PROJECT_ID}|g" terraform.tfvars
   echo ""
   echo "Created terraform.tfvars from template."
   echo "Please review and update terraform.tfvars before running terraform apply."

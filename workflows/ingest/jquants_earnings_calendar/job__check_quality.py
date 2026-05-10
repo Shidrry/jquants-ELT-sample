@@ -3,25 +3,26 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from libs.config import jquants_staging_dataset
-from libs.utils_data_quality import compute_null_rates, quality_check_context, run_zero_tolerance_check
+from libs.utils_data_quality import quality_check_context
 
 PIPELINE_NAME = Path(__file__).parent.name
 
+_TABLE = "earnings_calendar"
+_DATE_COL = "execution_date"
+
 # execution_date は SQL で直接セットされるため対象外。
-_CHECK_COLUMNS = ["Date", "Code", "CoName", "FY", "SectorNm", "FQ", "Section"]
+_NOT_NULL_COLUMNS = ["Date", "Code", "CoName", "FY", "SectorNm", "FQ", "Section"]
 
 
 def main() -> None:
-    with quality_check_context() as (client, project_id, env_name, logical_date):
-        execution_date = datetime.now(ZoneInfo("Asia/Tokyo")).date()
-        metrics = compute_null_rates(
-            client, project_id, jquants_staging_dataset(env_name), "earnings_calendar",
-            "execution_date", execution_date, _CHECK_COLUMNS,
-        )
-        run_zero_tolerance_check(
-            client, project_id, env_name, PIPELINE_NAME, logical_date, metrics,
-            check_date=execution_date,
-        )
+    with quality_check_context(
+        pipeline_name=PIPELINE_NAME,
+        dataset_fn=jquants_staging_dataset,
+        table=_TABLE,
+        date_col=_DATE_COL,
+        check_date_fn=lambda: datetime.now(ZoneInfo("Asia/Tokyo")).date(),
+    ) as qc:
+        qc.check_not_null_static(columns=_NOT_NULL_COLUMNS)
 
 
 if __name__ == "__main__":

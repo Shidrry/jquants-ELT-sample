@@ -4,12 +4,6 @@ __metadata__:
     time_zone: "Asia/Tokyo"
     argument:
       args: {}
-  jobs:
-    - id: check_quality
-      py: workflows/ingest/jquants_fins_summary_confirmed/job__check_quality.py
-      memory: 512Mi
-      cpu: "1"
-      timeout: 300
 
 main:
   params: [args]
@@ -132,7 +126,7 @@ main:
     - run_quality_check:
         call: googleapis.run.v2.projects.locations.jobs.run
         args:
-          name: ${base_job + "jquants-fins-summary-confirmed--check-quality"}
+          name: ${base_job + "jquants-fins-summary--check-quality"}
           body:
             overrides:
               containerOverrides:

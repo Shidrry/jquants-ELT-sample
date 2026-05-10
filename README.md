@@ -9,7 +9,7 @@ The pipeline handles **5 data feeds** across multiple schedules, serves **3,900+
 - **Zero-server architecture**: Cloud Run Jobs (batch) + Cloud Run Services (API) + Cloud Workflows (orchestration) — no VMs, no persistent processes, pay-per-execution
 - **Full Infrastructure as Code**: Every GCP resource — IAM, GCS, BigQuery, Artifact Registry, Cloud Build triggers, Dataform, Secret Manager — is declared in Terraform and version-controlled
 - **GitOps multi-environment**: Branch push (`develop` / `main`) is the single deployment trigger; dev and prod are structurally identical, isolated by dataset naming convention
-- **Statistical data quality**: NULL rates are tracked per column per pipeline in `pipeline_metadata.data_quality_metrics` and compared against a 60-day rolling average; anomalies exceeding a 5 percentage-point delta trigger Discord alerts without blocking the pipeline
+- **Composable data quality checks**: A `QualityChecker` context manager exposes per-pipeline checks (`check_row_count`, `check_null_rate_anomaly`, `check_not_null_static`, `check_not_null_dynamic`, `check_allowed_values`, `check_value_range`); failures are aggregated into a single Discord alert per run without blocking the pipeline
 - **Idempotent loads**: Daily BigQuery partitions are overwritten on re-run (`WRITE_TRUNCATE`), making backfills and reruns safe by design
 - **Self-healing CI/CD**: Cloud Build deletes Cloud Run / Workflows / Scheduler resources that no longer exist in the repository, preventing orphaned infrastructure drift
 
@@ -22,7 +22,7 @@ Cloud Scheduler (OIDC)
               ├─► market_open (Cloud Run Service) ── skip if market closed
               ├─► ingest_to_gcs  (Cloud Run Job)  ── J-Quants API → GCS Parquet
               ├─► load_to_bigquery (Cloud Run Job) ── GCS → BigQuery (partitioned)
-              └─► check_quality   (Cloud Run Job)  ── NULL rate anomaly check → Discord
+              └─► check_quality   (Cloud Run Job)  ── QualityChecker composable checks → Discord
                                                         │
                                                    Dataform (triggered after load)
                                                         └─► mart.report_stock_dashboard
@@ -43,7 +43,7 @@ Each pipeline is independently deployable. The orchestration layer (`workflow.ya
 | `jquants_master` | Company master | 03:00 on 10th of month | `staging_jquants.master` |
 | `daily_monitoring_dashboard` | Dataform transform | 18:20 weekdays | `mart.report_stock_dashboard` |
 
-`jquants_fins_summary_confirmed` reuses the ingest/load jobs from `jquants_fins_summary` and overwrites the same table with confirmed (revised) financial figures. It carries only its own `check_quality` job.
+`jquants_fins_summary_confirmed` reuses the ingest/load/check_quality jobs from `jquants_fins_summary` and overwrites the same table with confirmed (revised) financial figures.
 
 ## Key Design Decisions
 
@@ -56,12 +56,18 @@ Every workflow begins with a call to the J-Quants trading calendar API. If the t
 ### Retry logic for API update latency
 The OHLCV pipeline retries up to 6 times at 5-minute intervals when 0 records are returned. The J-Quants API for daily prices is updated after market close and the exact timing varies; polling is safer than a fixed delay.
 
-### Statistical anomaly detection — not just null checks
-Each `check_quality` job computes per-column NULL rates for the day's load and compares them against the 60-day rolling average stored in `pipeline_metadata.data_quality_metrics`. Anomalies are flagged when the delta exceeds 5 percentage points. Row counts are separately compared against the previous business day (threshold: 80%). Both checks alert via Discord without failing the pipeline — they are warnings, not blockers.
+### Composable quality checks — aggregated alerting, never blocking
+Each `check_quality` job opens a `quality_check_context()` and composes per-pipeline checks inside the `with` block. Individual failures accumulate as warnings in Cloud Logging; on block exit, a single aggregated Discord message is sent automatically (the context manager guarantees the call, eliminating "forgot to notify" bugs). Jobs always exit 0 — quality issues are warnings, not blockers, since upstream API issues cannot be fixed by retrying the workflow.
 
-Two check modes are implemented:
-- **`run_anomaly_check`**: statistical comparison against historical baseline (used for feeds where some NULLs are structurally expected)
-- **`run_zero_tolerance_check`**: any NULL is an alert (used for feeds where the schema guarantees completeness)
+Available checks on the `QualityChecker`:
+- **`check_row_count`** — current-day row count vs. previous N-day average (threshold ratio)
+- **`check_null_rate_anomaly`** — NULL-rate delta against the previous N-day baseline
+- **`check_not_null_static`** — explicit must-not-be-null columns (any NULL alerts)
+- **`check_not_null_dynamic`** — required columns auto-detected per dimension from historical NULL rate (e.g. `DocType`-keyed columns whose 365-day NULL rate ≤ 5%)
+- **`check_allowed_values`** — values outside an allow-list (early-detect upstream schema changes)
+- **`check_value_range`** — values outside `[min, max]`
+
+Discord notification failures are caught and logged at ERROR — a webhook outage never breaks the job.
 
 ### API version migration with zero downstream impact
 The J-Quants v2 API uses abbreviated column names (`O`, `H`, `L`, `C`, `Vo`, etc.). The ingestion layer maps these back to the v1 full names (`Open`, `High`, `Low`, `Close`, `Volume`, etc.) before writing to Parquet — keeping the BigQuery schema and all downstream SQL unchanged across the API version migration.
@@ -100,7 +106,7 @@ Each pipeline's `workflow.yaml` carries a `__metadata__` block that declares its
 │   ├── config.py              # GCP resource naming conventions
 │   ├── utils.py               # GCS, Secret Manager, env helpers
 │   ├── utils_bigquery.py      # BigQuery load with 2-stage CAST
-│   ├── utils_data_quality.py  # NULL rate anomaly checks + row count comparison
+│   ├── utils_data_quality.py  # QualityChecker: composable checks + aggregated Discord alert
 │   ├── utils_discord.py       # Discord error notifications
 │   ├── utils_jquants.py       # J-Quants API client (paginated)
 │   └── utils_metadata.py      # Pipeline run metadata recording
@@ -113,7 +119,7 @@ Each pipeline's `workflow.yaml` carries a `__metadata__` block that declares its
 │   │   │   ├── workflow.yaml          # Cloud Workflows definition + schedule metadata
 │   │   │   ├── job__ingest_to_gcs.py  # Fetch from J-Quants API → GCS
 │   │   │   ├── job__load_to_bigquery.py # GCS Parquet → BigQuery
-│   │   │   └── job__check_quality.py  # NULL rate anomaly check + row count alert
+│   │   │   └── job__check_quality.py  # Composes QualityChecker checks for this pipeline
 │   │   ├── jquants_fins_summary/
 │   │   ├── jquants_fins_summary_confirmed/
 │   │   ├── jquants_earnings_calendar/

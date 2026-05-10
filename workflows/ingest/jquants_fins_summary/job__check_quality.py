@@ -1,36 +1,81 @@
 from pathlib import Path
 
 from libs.config import jquants_staging_dataset
-from libs.utils_data_quality import compute_null_rates, quality_check_context, run_anomaly_check
+from libs.utils_data_quality import quality_check_context
 
 PIPELINE_NAME = Path(__file__).parent.name
 
-# 監視カラムの優先度:
-#   高: ShOutFY / TrShFY → 時価総額算出（close_price × (ShOutFY - COALESCE(TrShFY, 0))）に
-#       直結し、市場参加フィルタ（時価総額ベース集計）に影響する。
-#   中: Sales / OP / NP 等 → 現時点の SQL では未参照だが、API 仕様変更によるサイレントな
-#       NULL 増加を DocType 別に早期検知するためにあわせて記録する。
-# DocType・DiscDate・Code は結合キーのため次元集計・フィルタで担保し、ここでは数値系のみ対象とする。
-CHECK_COLUMNS = [
-    # int_daily_stock_metrics: 時価総額算出に直結
-    "ShOutFY", "TrShFY",
-    # 前期・前々期の実績値
-    "EPS", "Sales",
-    # 今期予想（FEPS が null の FY 開示時は NxF* を使用）
-    "FEPS", "NxFEPS", "FSales", "NxFSales",
-    # 直接参照はないが API 仕様変更の早期検知のために記録
-    "OP", "NP", "TA", "Eq", "BPS", "FOP", "FNP",
+_TABLE = "fins_summary"
+_DATE_COL = "DiscDate"
+
+# J-Quants API に定義された DocType の全値（2025年7月時点）
+# 未知の値が混入した場合に検知するためのホワイトリスト
+_KNOWN_DOC_TYPES = [
+    "FYFinancialStatements_Consolidated_JP",
+    "FYFinancialStatements_Consolidated_US",
+    "FYFinancialStatements_NonConsolidated_JP",
+    "FYFinancialStatements_Consolidated_JMIS",
+    "FYFinancialStatements_NonConsolidated_IFRS",
+    "FYFinancialStatements_Consolidated_IFRS",
+    "FYFinancialStatements_NonConsolidated_Foreign",
+    "FYFinancialStatements_Consolidated_Foreign",
+    "FYFinancialStatements_Consolidated_REIT",
+    "1QFinancialStatements_Consolidated_REIT",
+    "2QFinancialStatements_Consolidated_REIT",
+    "3QFinancialStatements_Consolidated_REIT",
+    "OtherPeriodFinancialStatements_Consolidated_REIT",
+    "1QFinancialStatements_Consolidated_JP",
+    "1QFinancialStatements_Consolidated_US",
+    "1QFinancialStatements_NonConsolidated_JP",
+    "1QFinancialStatements_Consolidated_JMIS",
+    "1QFinancialStatements_NonConsolidated_IFRS",
+    "1QFinancialStatements_Consolidated_IFRS",
+    "1QFinancialStatements_NonConsolidated_Foreign",
+    "1QFinancialStatements_Consolidated_Foreign",
+    "2QFinancialStatements_Consolidated_JP",
+    "2QFinancialStatements_Consolidated_US",
+    "2QFinancialStatements_NonConsolidated_JP",
+    "2QFinancialStatements_Consolidated_JMIS",
+    "2QFinancialStatements_NonConsolidated_IFRS",
+    "2QFinancialStatements_Consolidated_IFRS",
+    "2QFinancialStatements_NonConsolidated_Foreign",
+    "2QFinancialStatements_Consolidated_Foreign",
+    "3QFinancialStatements_Consolidated_JP",
+    "3QFinancialStatements_Consolidated_US",
+    "3QFinancialStatements_NonConsolidated_JP",
+    "3QFinancialStatements_Consolidated_JMIS",
+    "3QFinancialStatements_NonConsolidated_IFRS",
+    "3QFinancialStatements_Consolidated_IFRS",
+    "3QFinancialStatements_NonConsolidated_Foreign",
+    "3QFinancialStatements_Consolidated_Foreign",
+    "OtherPeriodFinancialStatements_Consolidated_JP",
+    "OtherPeriodFinancialStatements_Consolidated_US",
+    "OtherPeriodFinancialStatements_NonConsolidated_JP",
+    "OtherPeriodFinancialStatements_Consolidated_JMIS",
+    "OtherPeriodFinancialStatements_NonConsolidated_IFRS",
+    "OtherPeriodFinancialStatements_Consolidated_IFRS",
+    "OtherPeriodFinancialStatements_NonConsolidated_Foreign",
+    "OtherPeriodFinancialStatements_Consolidated_Foreign",
+    "DividendForecastRevision",
+    "EarnForecastRevision",
+    "REITDividendForecastRevision",
+    "REITEarnForecastRevision",
 ]
 
-
 def main() -> None:
-    with quality_check_context() as (client, project_id, env_name, logical_date):
-        metrics = compute_null_rates(
-            client, project_id, jquants_staging_dataset(env_name), "fins_summary",
-            "DiscDate", logical_date, CHECK_COLUMNS,
+    with quality_check_context(
+        pipeline_name=PIPELINE_NAME,
+        dataset_fn=jquants_staging_dataset,
+        table=_TABLE,
+        date_col=_DATE_COL,
+    ) as qc:
+        qc.check_allowed_values(column="DocType", allowed=_KNOWN_DOC_TYPES)
+        # 全カラムを対象に DocType ごとの過去1年 NULL 率 ≤ 5% を必須カラムとして動的に検出
+        qc.check_not_null_dynamic(
             dimension_col="DocType",
+            baseline_days=365,
+            baseline_null_threshold=0.05,
         )
-        run_anomaly_check(client, project_id, env_name, PIPELINE_NAME, logical_date, metrics)
 
 
 if __name__ == "__main__":
